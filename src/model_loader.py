@@ -17,18 +17,28 @@ class LoadedModelParts:
     hf_config: Any
 
 
-def load_model_parts(model_name_or_path: str, dtype: str = "float16") -> LoadedModelParts:
+def load_model_parts(
+    model_name_or_path: str,
+    dtype: str = "float16",
+    device: str = "cpu",
+) -> LoadedModelParts:
     torch_dtype = getattr(torch, dtype)
+
+    # When targeting GPU, load directly onto the device so weights never
+    # stage as a full second copy in CPU RAM.
+    if device == "cpu":
+        device_map = None
+    else:
+        device_map = device  # e.g. "cuda:0" or "cuda"
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         low_cpu_mem_usage=True,
-        device_map=None,
+        device_map=device_map,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
 
-    # These attribute names vary by model family.
-    # Adjust once you decide on a target family.
     base = model.model
     embed_tokens = base.embed_tokens
     layers = list(base.layers)
@@ -37,8 +47,8 @@ def load_model_parts(model_name_or_path: str, dtype: str = "float16") -> LoadedM
 
     model.eval()
 
-    # Keep everything on CPU initially.
-    model.cpu()
+    if device == "cpu":
+        model.cpu()
 
     return LoadedModelParts(
         tokenizer=tokenizer,

@@ -29,12 +29,22 @@ class CPUWeightStore:
         self.pin_memory = pin_memory
 
         for layer in layers:
-            state = {
-                k: v.detach().cpu().contiguous()
-                for k, v in layer.state_dict().items()
-            }
-            if pin_memory:
-                state = _pin_tensor_tree(state)
+            # Build the pinned state one key at a time.
+            # .clone() ensures the new tensor owns its storage independently
+            # of the layer's parameter storage, so we can free the original.
+            state: dict[str, torch.Tensor] = {}
+            for k, v in layer.state_dict().items():
+                t = v.detach().cpu().clone()
+                if pin_memory:
+                    t = t.pin_memory()
+                state[k] = t
+
+            # Release the original parameter storage immediately.
+            # Without this, both the model copy (~26 GB for 13B) and the
+            # pinned copy live in RAM at the same time, causing OOM.
+            for p in layer.parameters():
+                p.data = torch.empty(0, dtype=p.dtype)
+
             self._layers.append(state)
             self._layer_bytes.append(_state_dict_nbytes(state))
 
