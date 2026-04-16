@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 from .config import AppConfig, GenerationConfig, ModelConfig, OffloadConfig, LoggingConfig
-from .cpu_weight_store import CPUWeightStore
+from .cpu_weight_store import MmapWeightStore
 from .forward_engine import ForwardEngine
 from .generation import Generator
 from .gpu_buffer_pool import GPUBufferPool
@@ -55,6 +55,14 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Maximum GPU memory reserved for KV cache (GB, layered mode only).",
     )
+
+    p.add_argument(
+        "--max-seq-len", 
+        type=int, 
+        default=2048, 
+        help="Maximum sequence length for static KV cache allocation."
+    )
+
     p.add_argument("--log-dir", default="logs")
     p.add_argument("--no-profile", action="store_true", help="Disable CUDA event profiling.")
     return p.parse_args()
@@ -68,6 +76,7 @@ def _build_vram_engine(
     parts,
     cfg: AppConfig,
     logger: ExperimentLogger,
+    max_seq_len: int,
 ) -> tuple[ForwardEngine, KVCacheManager]:
     """All decoder layers already on GPU (loaded there by load_model_parts)."""
     print(f"[vram] Using {len(parts.layers)} layers already on GPU.")
@@ -76,6 +85,7 @@ def _build_vram_engine(
     kv_manager = KVCacheManager(
         num_layers=len(vram_layers),
         max_gpu_kv_bytes=cfg.offload.max_gpu_kv_bytes,
+        max_seq_len=max_seq_len,
         enable_cpu_offload=False,
         pin_cpu_memory=False,
     )
@@ -86,6 +96,7 @@ def _build_vram_engine(
         kv_manager=kv_manager,
         logger=logger,
         vram_layers=vram_layers,
+        rotary_emb=parts.rotary_emb,
         profile_cuda=cfg.offload.profile_cuda,
     )
     return engine, kv_manager
@@ -96,29 +107,40 @@ def _build_layered_engine(
     cfg: AppConfig,
     logger: ExperimentLogger,
     torch_dtype: torch.dtype,
+    max_seq_len: int,
 ) -> tuple[ForwardEngine, KVCacheManager]:
     """
     Double-buffered streaming mode.
 
     Weight double-buffer: two GPU slots (buffer_depth=2) alternate so one
-    is being computed while the next is copied from pinned CPU memory.
+    is being computed while the next is copied from the safetensors mmap.
 
     KV double-buffer: the KV prefetch for layer N+1 is issued concurrently
     with compute for layer N, so the KV H2D copy overlaps with compute.
+
+    Weight store: MmapWeightStore reads directly from the on-disk safetensors
+    files via mmap.  Tensors are file-backed pages (evictable under pressure)
+    rather than anonymous/pinned shmem, so the model size does not count
+    against the cgroup anonymous memory limit.
     """
-    # GPUBufferPool deep-copies the prototype layer, so it MUST be created
-    # before CPUWeightStore, which frees each layer's parameters after pinning.
+    # GPUBufferPool deep-copies the prototype layer for the buffer shapes.
+    # Must happen BEFORE we free layer params below.
     gpu_pool = GPUBufferPool(
         prototype_layer=parts.layers[0],
         buffer_depth=cfg.offload.buffer_depth,
         device=cfg.model.device,
         dtype=torch_dtype,
     )
-    print(f"[layered] Pinning {len(parts.layers)} layers in CPU memory …")
-    weight_store = CPUWeightStore(
-        layers=parts.layers,
-        pin_memory=cfg.offload.pin_cpu_memory,
-    )
+
+    # Free the in-memory layer params now that GPUBufferPool has its copy.
+    # from_pretrained with low_cpu_mem_usage already loads weights as
+    # file-backed pages; this just drops those references explicitly.
+    for layer in parts.layers:
+        for p in layer.parameters():
+            p.data = torch.empty(0, dtype=p.dtype)
+
+    print(f"[layered] Opening {len(parts.layers)} layers via mmap from {parts.model_path} …")
+    weight_store = MmapWeightStore(parts.model_path)
     streams = StreamManager()
     prefetcher = LayerPrefetcher(
         weight_store=weight_store,
@@ -130,8 +152,9 @@ def _build_layered_engine(
     kv_manager = KVCacheManager(
         num_layers=weight_store.num_layers(),
         max_gpu_kv_bytes=cfg.offload.max_gpu_kv_bytes,
+        max_seq_len=max_seq_len,
         enable_cpu_offload=cfg.offload.enable_kv_cpu_offload,
-        pin_cpu_memory=cfg.offload.pin_cpu_memory,
+        pin_cpu_memory=False,  # no shmem for KV offload on constrained cgroups
     )
     engine = ForwardEngine(
         embed_tokens=parts.embed_tokens,
@@ -142,6 +165,7 @@ def _build_layered_engine(
         streams=streams,
         kv_manager=kv_manager,
         logger=logger,
+        rotary_emb=parts.rotary_emb,
         profile_cuda=cfg.offload.profile_cuda,
     )
     return engine, kv_manager
@@ -178,9 +202,9 @@ def main() -> None:
     torch_dtype = getattr(torch, cfg.model.dtype)
 
     if cfg.offload.vram_only:
-        engine, kv_manager = _build_vram_engine(parts, cfg, logger)
+        engine, kv_manager = _build_vram_engine(parts, cfg, logger, args.max_seq_len)
     else:
-        engine, kv_manager = _build_layered_engine(parts, cfg, logger, torch_dtype)
+        engine, kv_manager = _build_layered_engine(parts, cfg, logger, torch_dtype, args.max_seq_len)
 
     eos_id = parts.tokenizer.eos_token_id
     generator = Generator(

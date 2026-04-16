@@ -1,9 +1,14 @@
-python -m src.run_infer--model meta-llama/Llama-2-13b-chat-hf \
-                    --mode vram \
-                    --prompt "What is the capital of France?"
+python -m src.run_infer \
+    --model meta-llama/Llama-2-13b-chat-hf \
+    --mode vram \
+    --max-seq-len 2048 \
+    --prompt "What is the capital of France?"
 
 
-python -m src.run_infer --model meta-llama/Llama-2-13b-chat-hf \
-                    --mode layered --buffer-depth 2 \
-                    --max-gpu-kv-gb 2.0 \
-                    --prompt "What is the capital of France?"
+python -m src.run_infer \
+    --model meta-llama/Llama-2-13b-chat-hf \
+    --mode layered \
+    --buffer-depth 2 \
+    --max-gpu-kv-gb 2.0 \
+    --max-seq-len 2048 \
+    --prompt "What is the capital of France?"

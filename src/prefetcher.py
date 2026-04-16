@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .cpu_weight_store import CPUWeightStore
+from .cpu_weight_store import MmapWeightStore
 from .gpu_buffer_pool import GPUBufferPool, LayerSlot
 from .logger import ExperimentLogger
 from .timing import CudaTimer
@@ -21,7 +21,7 @@ class PrefetchStats:
 class LayerPrefetcher:
     def __init__(
         self,
-        weight_store: CPUWeightStore,
+        weight_store: MmapWeightStore,
         gpu_pool: GPUBufferPool,
         copy_stream: torch.cuda.Stream,
         logger: ExperimentLogger,
@@ -50,6 +50,11 @@ class LayerPrefetcher:
             timer.start(self.copy_stream)
             module_state = slot.module.state_dict()
             for name, cpu_tensor in cpu_state.items():
+                if name not in module_state:
+                    # Skip keys not in the live module (e.g. non-persistent buffers
+                    # like rotary_emb.inv_freq that are present in the safetensors
+                    # file but not registered in the module's state_dict).
+                    continue
                 module_state[name].copy_(cpu_tensor, non_blocking=True)
             timer.stop(self.copy_stream)
             ready_event.record(self.copy_stream)

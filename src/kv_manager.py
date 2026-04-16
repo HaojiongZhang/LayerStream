@@ -29,13 +29,16 @@ class KVCacheManager:
         self,
         num_layers: int,
         max_gpu_kv_bytes: int,
+        max_seq_len: int,
         enable_cpu_offload: bool = True,
         pin_cpu_memory: bool = True,
     ) -> None:
         self.max_gpu_kv_bytes = max_gpu_kv_bytes
+        self.max_seq_len = max_seq_len
         self.enable_cpu_offload = enable_cpu_offload
         self.pin_cpu_memory = pin_cpu_memory
         self.layer_kv: list[LayerKV] = [LayerKV() for _ in range(num_layers)]
+        self.current_seq_len = 0 
 
     def get_layer_kv(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         rec = self.layer_kv[layer_idx]
@@ -46,11 +49,12 @@ class KVCacheManager:
         layer_idx: int,
         key: torch.Tensor | None,
         value: torch.Tensor | None,
-        ready_event: torch.cuda.Event | None = None,
+        stream: torch.cuda.Stream | None = None,
     ) -> None:
         rec = self.layer_kv[layer_idx]
         rec.key = key
         rec.value = value
+        
         if key is None or value is None:
             rec.device = "none"
             rec.bytes_total = 0
@@ -59,10 +63,14 @@ class KVCacheManager:
 
         rec.device = str(key.device)
         rec.bytes_total = _tensor_pair_nbytes(key, value)
-        if ready_event is None:
-            ready_event = torch.cuda.Event()
-            ready_event.record(torch.cuda.current_stream())
-        rec.ready_event = ready_event
+        
+        if stream is None:
+            stream = torch.cuda.current_stream()
+            
+        if rec.ready_event is None:
+            rec.ready_event = torch.cuda.Event()
+            
+        rec.ready_event.record(stream)
 
     def prefetch_layer_kv(self, layer_idx: int, stream: torch.cuda.Stream) -> None:
         rec = self.layer_kv[layer_idx]
@@ -121,9 +129,6 @@ class KVCacheManager:
         if total_gpu <= self.max_gpu_kv_bytes:
             return
 
-        # Simple policy: offload from lower layer indices upward first.
-        # protected_layer (if set) is skipped — it holds a prefetched KV that
-        # will be consumed by the very next layer iteration.
         for i, rec in enumerate(self.layer_kv):
             if total_gpu <= self.max_gpu_kv_bytes:
                 break
