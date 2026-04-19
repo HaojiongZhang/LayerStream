@@ -5,7 +5,13 @@ from pathlib import Path
 
 import torch
 
-from .config import AppConfig, GenerationConfig, ModelConfig, OffloadConfig, LoggingConfig
+from .config import (
+    AppConfig,
+    GenerationConfig,
+    LoggingConfig,
+    ModelConfig,
+    OffloadConfig,
+)
 from .cpu_weight_store import MmapWeightStore
 from .forward_engine import ForwardEngine
 from .generation import Generator
@@ -14,6 +20,7 @@ from .kv_manager import KVCacheManager
 from .logger import ExperimentLogger
 from .model_loader import load_model_parts
 from .prefetcher import LayerPrefetcher
+from .profiler import Profiler
 from .streams import StreamManager
 
 
@@ -25,9 +32,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model",
         default="meta-llama/Llama-2-13b-chat-hf",
-        help="HuggingFace model name or path to a local checkpoint. "
-             "For Llama-2 you must first accept the license and run "
-             "'huggingface-cli login'.",
+        help=(
+            "HuggingFace model name or path to a local checkpoint. "
+            "For Llama-2 you must first accept the license and run "
+            "'huggingface-cli login'."
+        ),
     )
     p.add_argument(
         "--mode",
@@ -41,13 +50,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--prompt", default="Hello, I am a language model,")
     p.add_argument("--max-new-tokens", type=int, default=64)
-    p.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
+    p.add_argument(
+        "--dtype",
+        default="float16",
+        choices=["float16", "bfloat16", "float32"],
+    )
     p.add_argument(
         "--buffer-depth",
         type=int,
         default=2,
-        help="Number of GPU weight-buffer slots (layered mode only). "
-             "2 = classic double-buffer.",
+        help="Number of GPU weight-buffer slots (layered mode only). 2 = classic double-buffer.",
     )
     p.add_argument(
         "--max-gpu-kv-gb",
@@ -55,16 +67,39 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Maximum GPU memory reserved for KV cache (GB, layered mode only).",
     )
-
     p.add_argument(
-        "--max-seq-len", 
-        type=int, 
-        default=2048, 
-        help="Maximum sequence length for static KV cache allocation."
+        "--kv-cache-bits",
+        type=int,
+        choices=[16, 8, 4],
+        default=16,
+        help=(
+            "Quantize CPU-offloaded KV cache to this bit-width. "
+            "16 = no KV quantization, 8 = symmetric int8 KV on CPU."
+        ),
     )
-
+    p.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=2048,
+        help="Maximum sequence length for static KV cache allocation.",
+    )
     p.add_argument("--log-dir", default="logs")
     p.add_argument("--no-profile", action="store_true", help="Disable CUDA event profiling.")
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "Enable the sampling profiler: GPU memory, KV-cache bytes, "
+            "compute utilization (via pynvml), and token throughput/latency. "
+            "Writes logs/profile_samples.jsonl + logs/profile_summary.json."
+        ),
+    )
+    p.add_argument(
+        "--profile-hz",
+        type=float,
+        default=20.0,
+        help="Sampling rate for --profile (Hz).",
+    )
     return p.parse_args()
 
 
@@ -88,7 +123,9 @@ def _build_vram_engine(
         max_seq_len=max_seq_len,
         enable_cpu_offload=False,
         pin_cpu_memory=False,
+        kv_cache_bits=cfg.offload.kv_cache_bits,
     )
+
     engine = ForwardEngine(
         embed_tokens=parts.embed_tokens,
         final_norm=parts.final_norm,
@@ -102,6 +139,7 @@ def _build_vram_engine(
     return engine, kv_manager
 
 
+
 def _build_layered_engine(
     parts,
     cfg: AppConfig,
@@ -112,16 +150,19 @@ def _build_layered_engine(
     """
     Double-buffered streaming mode.
 
-    Weight double-buffer: two GPU slots (buffer_depth=2) alternate so one
-    is being computed while the next is copied from the safetensors mmap.
+    Weight double-buffer:
+        two GPU slots (buffer_depth=2) alternate so one is being computed
+        while the next is copied from the safetensors mmap.
 
-    KV double-buffer: the KV prefetch for layer N+1 is issued concurrently
-    with compute for layer N, so the KV H2D copy overlaps with compute.
+    KV double-buffer:
+        the KV prefetch for layer N+1 is issued concurrently with compute for
+        layer N, so the KV H2D copy overlaps with compute.
 
-    Weight store: MmapWeightStore reads directly from the on-disk safetensors
-    files via mmap.  Tensors are file-backed pages (evictable under pressure)
-    rather than anonymous/pinned shmem, so the model size does not count
-    against the cgroup anonymous memory limit.
+    Weight store:
+        MmapWeightStore reads directly from the on-disk safetensors files via mmap.
+        Tensors are file-backed pages (evictable under pressure) rather than
+        anonymous/pinned shmem, so the model size does not count against the
+        cgroup anonymous memory limit.
     """
     # GPUBufferPool deep-copies the prototype layer for the buffer shapes.
     # Must happen BEFORE we free layer params below.
@@ -149,13 +190,16 @@ def _build_layered_engine(
         logger=logger,
         profile_cuda=cfg.offload.profile_cuda,
     )
+
     kv_manager = KVCacheManager(
         num_layers=weight_store.num_layers(),
         max_gpu_kv_bytes=cfg.offload.max_gpu_kv_bytes,
         max_seq_len=max_seq_len,
         enable_cpu_offload=cfg.offload.enable_kv_cpu_offload,
         pin_cpu_memory=False,  # no shmem for KV offload on constrained cgroups
+        kv_cache_bits=cfg.offload.kv_cache_bits,
     )
+
     engine = ForwardEngine(
         embed_tokens=parts.embed_tokens,
         final_norm=parts.final_norm,
@@ -177,7 +221,6 @@ def _build_layered_engine(
 
 def main() -> None:
     args = parse_args()
-
     cfg = AppConfig(
         model=ModelConfig(
             model_name_or_path=args.model,
@@ -185,7 +228,8 @@ def main() -> None:
         ),
         offload=OffloadConfig(
             buffer_depth=args.buffer_depth,
-            max_gpu_kv_bytes=int(args.max_gpu_kv_gb * 1024 ** 3),
+            max_gpu_kv_bytes=int(args.max_gpu_kv_gb * 1024**3),
+            kv_cache_bits=args.kv_cache_bits,
             vram_only=(args.mode == "vram"),
             profile_cuda=not args.no_profile,
         ),
@@ -193,18 +237,32 @@ def main() -> None:
         logging=LoggingConfig(log_dir=Path(args.log_dir)),
     )
 
-    print(f"Loading model: {cfg.model.model_name_or_path}  (dtype={cfg.model.dtype}, mode={args.mode})")
+    print(
+        f"Loading model: {cfg.model.model_name_or_path} "
+        f"(dtype={cfg.model.dtype}, mode={args.mode})"
+    )
     logger = ExperimentLogger(cfg.logging.log_dir)
+
     # vram mode: load directly to GPU so weights never stage as a full copy in CPU RAM.
     # layered mode: load to CPU so CPUWeightStore can pin them layer-by-layer.
     load_device = cfg.model.device if cfg.offload.vram_only else "cpu"
-    parts = load_model_parts(cfg.model.model_name_or_path, dtype=cfg.model.dtype, device=load_device)
+    parts = load_model_parts(
+        cfg.model.model_name_or_path,
+        dtype=cfg.model.dtype,
+        device=load_device,
+    )
     torch_dtype = getattr(torch, cfg.model.dtype)
 
     if cfg.offload.vram_only:
         engine, kv_manager = _build_vram_engine(parts, cfg, logger, args.max_seq_len)
     else:
-        engine, kv_manager = _build_layered_engine(parts, cfg, logger, torch_dtype, args.max_seq_len)
+        engine, kv_manager = _build_layered_engine(
+            parts,
+            cfg,
+            logger,
+            torch_dtype,
+            args.max_seq_len,
+        )
 
     eos_id = parts.tokenizer.eos_token_id
     generator = Generator(
@@ -216,13 +274,39 @@ def main() -> None:
     )
 
     print(f"Generating (mode={args.mode}, max_new_tokens={args.max_new_tokens}) …")
-    result = generator.generate(
-        request_id=1,
-        prompt=args.prompt,
-        max_new_tokens=args.max_new_tokens,
-    )
+
+    request_id = 1
+    profiler: Profiler | None = None
+    if args.profile:
+        profiler = Profiler(
+            log_dir=cfg.logging.log_dir,
+            kv_manager=kv_manager,
+            sample_hz=args.profile_hz,
+            request_id=request_id,
+        )
+        profiler.start()
+
+    try:
+        result = generator.generate(
+            request_id=request_id,
+            prompt=args.prompt,
+            max_new_tokens=args.max_new_tokens,
+        )
+    finally:
+        if profiler is not None:
+            profiler.stop()
+
     print("\n--- Output ---")
     print(result.text)
+
+    if profiler is not None:
+        prompt_len = int(parts.tokenizer(args.prompt, return_tensors="pt")["input_ids"].shape[1])
+        summary = profiler.summary(
+            prompt_len=prompt_len,
+            generated_tokens=len(result.generated_ids),
+        )
+        profiler.write_summary(summary)
+        profiler.print_summary(summary)
 
 
 if __name__ == "__main__":

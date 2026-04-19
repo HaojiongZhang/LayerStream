@@ -40,7 +40,7 @@ class MmapWeightStore:
     def __init__(
         self,
         model_path: str | Path,
-        layer_prefix: str = "model.layers",
+        layer_prefix: str | None = None,
     ) -> None:
         model_path = Path(model_path)
         if not model_path.is_dir():
@@ -64,6 +64,9 @@ class MmapWeightStore:
                 "Download it with: huggingface-cli download <model> --local-dir <path>"
             )
 
+        if layer_prefix is None:
+            layer_prefix = self._detect_layer_prefix(weight_map)
+
         self._model_path = model_path
         self._weight_map = weight_map
         self._layer_prefix = layer_prefix
@@ -84,6 +87,41 @@ class MmapWeightStore:
             if m:
                 indices.add(int(m.group(1)))
         self._num_layers = max(indices) + 1 if indices else 0
+
+        if self._num_layers == 0:
+            sample = ", ".join(list(weight_map.keys())[:5])
+            raise RuntimeError(
+                f"MmapWeightStore found no decoder layers under prefix "
+                f"'{layer_prefix}' in {model_path}. Sample keys: {sample} …"
+            )
+
+        # Lazy cache for per-layer byte sizes.
+        self._layer_bytes_cache: dict[int, int] = {}
+
+    @staticmethod
+    def _detect_layer_prefix(weight_map: dict[str, str]) -> str:
+        """
+        Auto-detect the decoder-layer prefix (everything up to ``.layers.N.``).
+
+        Supports both Llama/Qwen2-style ``model.layers.N.*`` and multimodal
+        variants like Qwen3-VL / Qwen3-Next that nest the language model
+        (``model.language_model.layers.N.*``). Excludes non-decoder heads
+        such as ``mtp.layers.*`` (multi-token-prediction) by picking the
+        prefix with the greatest number of distinct layer indices.
+        """
+        pat = re.compile(r"^(.*)\.layers\.(\d+)\.")
+        prefix_to_indices: dict[str, set[int]] = {}
+        for key in weight_map:
+            m = pat.match(key)
+            if not m:
+                continue
+            prefix_to_indices.setdefault(m.group(1), set()).add(int(m.group(2)))
+
+        if not prefix_to_indices:
+            return "model.layers"
+
+        best_prefix = max(prefix_to_indices.items(), key=lambda kv: len(kv[1]))[0]
+        return f"{best_prefix}.layers"
 
         # Lazy cache for per-layer byte sizes.
         self._layer_bytes_cache: dict[int, int] = {}

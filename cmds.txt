@@ -12,3 +12,30 @@ python -m src.run_infer \
     --max-gpu-kv-gb 2.0 \
     --max-seq-len 2048 \
     --prompt "What is the capital of France?"
+
+python -m src.run_infer \
+    --model Qwen/Qwen2.5-14B-Instruct \
+    --mode layered \
+    --buffer-depth 2 \
+    --kv-cache-bits 8 \
+    --max-gpu-kv-gb 2.0 \
+    --max-seq-len 2048 \
+    --prompt "What is the capital of France?" \
+    --profile
+
+python -m src.run_infer \
+    --model Qwen/Qwen2.5-14B-Instruct \
+    --mode layered \
+    --buffer-depth 2 \
+    --kv-cache-bits 16 \
+    --max-gpu-kv-gb 2.0 \
+    --max-seq-len 2048 \
+    --prompt "What is the capital of France?" \
+    --profile
+
+python -m src.run_infer \
+    --model Qwen/Qwen2.5-14B-Instruct \
+    --mode vram \
+    --max-seq-len 2048 \
+    --prompt "What is the capital of France?" \
+    --profile

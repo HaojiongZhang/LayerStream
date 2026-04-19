@@ -20,6 +20,7 @@ class OffloadConfig:
     gpu_margin_bytes: int = 512 * 1024 * 1024
     max_gpu_kv_bytes: int = 2 * 1024 * 1024 * 1024
     enable_kv_cpu_offload: bool = True
+    kv_cache_bits: int = 16
     profile_cuda: bool = True
     profile_wall: bool = True
     # When True: all layers are kept on GPU; no CPU weight streaming or KV offload.
