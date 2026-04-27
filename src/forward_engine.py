@@ -35,23 +35,20 @@ class _SingleLayerCache(_CacheBase):  # type: ignore[misc]
         seq_len = key_states.shape[-2]
 
         if self.k_cache is None:
-            batch_size, num_heads, _, head_dim = key_states.shape
-            self.k_cache = torch.empty(
-                (batch_size, num_heads, self.max_seq_len, head_dim), 
-                dtype=key_states.dtype, device=key_states.device
-            )
-            self.v_cache = torch.empty(
-                (batch_size, num_heads, self.max_seq_len, head_dim), 
-                dtype=value_states.dtype, device=value_states.device
-            )
+            # First use: only allocate exactly what is needed, not max_seq_len.
+            self.k_cache = key_states.contiguous()
+            self.v_cache = value_states.contiguous()
+            self._seen = seq_len
+            return self.k_cache, self.v_cache
 
-        self.k_cache[:, :, self._seen : self._seen + seq_len, :] = key_states
-        self.v_cache[:, :, self._seen : self._seen + seq_len, :] = value_states
-        
+        # Existing cache + new states.
+        # This creates a compact cache of length old_seen + seq_len.
+        self.k_cache = torch.cat([self.k_cache[:, :, : self._seen, :], key_states], dim=-2).contiguous()
+        self.v_cache = torch.cat([self.v_cache[:, :, : self._seen, :], value_states], dim=-2).contiguous()
+
         self._seen += seq_len
-        
-        return self.k_cache[:, :, :self._seen, :], self.v_cache[:, :, :self._seen, :]
 
+        return self.k_cache, self.v_cache
     def get_seq_length(self, layer_idx: int = 0) -> int:
         return self._seen
 
@@ -64,6 +61,8 @@ class _SingleLayerCache(_CacheBase):  # type: ignore[misc]
     def get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:
         return self.max_seq_len - self._seen
         import inspect
+
+
 from dataclasses import dataclass
 from typing import Any
 
@@ -300,7 +299,7 @@ class ForwardEngine:
             total_compute_ms += compute_ms
 
             if presents is not None:
-                self.kv_manager.update_layer_kv(layer_idx, presents[0], presents[1])
+                self.kv_manager.update_layer_kv(layer_idx, presents[0].detach(), presents[1].detach())
 
             self.logger.log_layer(
                 request_id=request_id,
@@ -327,7 +326,6 @@ class ForwardEngine:
             total_compute_ms=total_compute_ms,
             total_wait_ms=0.0,
         )
-
     def _forward_streaming(
         self,
         request_id: int,
@@ -336,18 +334,37 @@ class ForwardEngine:
         attention_mask: torch.Tensor | None,
         position_ids: torch.Tensor | None,
     ) -> ForwardOutput:
+        def dbg_mem(tag: str) -> None:
+            torch.cuda.synchronize()
+            print(
+                f"[mem] {tag}: "
+                f"alloc={torch.cuda.memory_allocated() / 1024**2:.1f}MB "
+                f"reserved={torch.cuda.memory_reserved() / 1024**2:.1f}MB "
+                f"max_alloc={torch.cuda.max_memory_allocated() / 1024**2:.1f}MB "
+                f"max_reserved={torch.cuda.max_memory_reserved() / 1024**2:.1f}MB "
+                f"kv_gpu={self.kv_manager.total_gpu_kv_bytes() / 1024**2:.1f}MB "
+                f"kv_cpu={self.kv_manager.total_cpu_kv_bytes() / 1024**2:.1f}MB",
+                flush=True,
+            )
+
         total_copy_ms = 0.0
         total_compute_ms = 0.0
         total_wait_ms = 0.0
 
+        dbg_mem(f"tok={token_idx} start seq={input_ids.shape[1]}")
+
         hidden_states = self.embed_tokens(input_ids)
+        dbg_mem(f"tok={token_idx} after_embed hidden_shape={tuple(hidden_states.shape)}")
 
         pos_ids, cache_pos, pos_emb = self._make_position_info(hidden_states, input_ids)
+        dbg_mem(f"tok={token_idx} after_position_info")
+
         if position_ids is None:
             position_ids = pos_ids
 
         true_num_layers = self.prefetcher.weight_store.num_layers()
 
+        dbg_mem(f"tok={token_idx} before_prefetch_layer_0")
         stats = self.prefetcher.prefetch_layer(
             request_id=request_id,
             token_idx=token_idx,
@@ -355,25 +372,52 @@ class ForwardEngine:
             slot_idx=0,
         )
         total_copy_ms += stats.copy_ms
+        dbg_mem(f"tok={token_idx} after_prefetch_layer_0 copy_ms={stats.copy_ms:.3f}")
+
+        dbg_mem(f"tok={token_idx} before_prefetch_kv_layer_0")
         self.kv_manager.prefetch_layer_kv(0, self.streams.kv_stream)
+        dbg_mem(f"tok={token_idx} after_prefetch_kv_layer_0")
 
         for layer_idx in range(true_num_layers):
             cur_slot_idx = layer_idx % self.gpu_pool.num_slots()
             next_layer_idx = layer_idx + 1
             next_slot_idx = next_layer_idx % self.gpu_pool.num_slots()
 
+            dbg_mem(f"tok={token_idx} layer={layer_idx} loop_start")
+
             slot = self.prefetcher.get_slot_for_layer(cur_slot_idx, layer_idx)
 
             wait_timer = WallTimer()
             wait_timer.start()
+
+            dbg_mem(f"tok={token_idx} layer={layer_idx} before_wait_ready")
             self.prefetcher.wait_until_ready(slot, self.streams.compute_stream)
             self.kv_manager.wait_for_layer_kv(layer_idx, self.streams.compute_stream)
             wait_timer.stop()
+
             total_wait_ms += wait_timer.elapsed_ms
+            dbg_mem(
+                f"tok={token_idx} layer={layer_idx} after_wait_ready "
+                f"wait_ms={wait_timer.elapsed_ms:.3f}"
+            )
 
             key, value = self.kv_manager.get_layer_kv(layer_idx)
 
+            if key is not None and value is not None:
+                print(
+                    f"[kv] tok={token_idx} layer={layer_idx} "
+                    f"key_shape={tuple(key.shape)} key_device={key.device} "
+                    f"value_shape={tuple(value.shape)} value_device={value.device}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[kv] tok={token_idx} layer={layer_idx} no_past_kv",
+                    flush=True,
+                )
+
             if next_layer_idx < true_num_layers:
+                dbg_mem(f"tok={token_idx} layer={layer_idx} before_prefetch_layer_{next_layer_idx}")
                 stats = self.prefetcher.prefetch_layer(
                     request_id=request_id,
                     token_idx=token_idx,
@@ -381,11 +425,22 @@ class ForwardEngine:
                     slot_idx=next_slot_idx,
                 )
                 total_copy_ms += stats.copy_ms
+                dbg_mem(
+                    f"tok={token_idx} layer={layer_idx} after_prefetch_layer_{next_layer_idx} "
+                    f"copy_ms={stats.copy_ms:.3f}"
+                )
+
+                dbg_mem(f"tok={token_idx} layer={layer_idx} before_prefetch_kv_{next_layer_idx}")
                 self.kv_manager.prefetch_layer_kv(next_layer_idx, self.streams.kv_stream)
+                dbg_mem(f"tok={token_idx} layer={layer_idx} after_prefetch_kv_{next_layer_idx}")
 
             compute_timer = CudaTimer(enabled=self.profile_cuda)
+
+            dbg_mem(f"tok={token_idx} layer={layer_idx} before_compute")
+
             with torch.cuda.stream(self.streams.compute_stream):
                 compute_timer.start(self.streams.compute_stream)
+
                 hidden_states, presents = self._run_layer(
                     slot.module,
                     hidden_states=hidden_states,
@@ -396,17 +451,41 @@ class ForwardEngine:
                     position_embeddings=pos_emb,
                     cache_position=cache_pos,
                 )
+
                 compute_timer.stop(self.streams.compute_stream)
-                
+
                 if presents is not None:
-                    self.kv_manager.update_layer_kv(
-                        layer_idx, presents[0], presents[1], stream=self.streams.compute_stream
+                    print(
+                        f"[presents] tok={token_idx} layer={layer_idx} "
+                        f"k_shape={tuple(presents[0].shape)} k_device={presents[0].device} "
+                        f"v_shape={tuple(presents[1].shape)} v_device={presents[1].device}",
+                        flush=True,
                     )
+
+                    dbg_mem(f"tok={token_idx} layer={layer_idx} before_update_kv")
+                    self.kv_manager.update_layer_kv(
+                        layer_idx,
+                        presents[0].detach(),
+                        presents[1].detach(),
+                        stream=self.streams.compute_stream,
+                    )
+                    dbg_mem(f"tok={token_idx} layer={layer_idx} after_update_kv")
+                    del presents
+                    key = None
+                    value = None
+                    torch.cuda.empty_cache()  # debugging only
 
             compute_ms = compute_timer.elapsed_ms()
             total_compute_ms += compute_ms
 
+            dbg_mem(
+                f"tok={token_idx} layer={layer_idx} after_compute "
+                f"compute_ms={compute_ms:.3f}"
+            )
+
+            dbg_mem(f"tok={token_idx} layer={layer_idx} before_offload protected={next_layer_idx}")
             self.kv_manager.maybe_offload_old_layers(protected_layer=next_layer_idx)
+            dbg_mem(f"tok={token_idx} layer={layer_idx} after_offload protected={next_layer_idx}")
 
             self.logger.log_layer(
                 request_id=request_id,
@@ -421,13 +500,18 @@ class ForwardEngine:
             )
 
         if self.final_norm is not None:
+            dbg_mem(f"tok={token_idx} before_final_norm")
             with torch.cuda.stream(self.streams.compute_stream):
                 hidden_states = self.final_norm(hidden_states)
+            dbg_mem(f"tok={token_idx} after_final_norm")
 
+        dbg_mem(f"tok={token_idx} before_lm_head")
         with torch.cuda.stream(self.streams.compute_stream):
             logits = self.lm_head(hidden_states)
+        dbg_mem(f"tok={token_idx} after_lm_head")
 
         self.kv_manager.current_seq_len += input_ids.shape[1]
+        dbg_mem(f"tok={token_idx} end current_seq_len={self.kv_manager.current_seq_len}")
 
         return ForwardOutput(
             logits=logits,

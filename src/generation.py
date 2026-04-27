@@ -36,7 +36,8 @@ class Generator:
         allocated = torch.cuda.memory_allocated() / (1024 ** 2)
         reserved = torch.cuda.memory_reserved() / (1024 ** 2)
         return allocated, reserved
-
+    
+    @torch.inference_mode()
     def generate(
         self,
         request_id: int,
