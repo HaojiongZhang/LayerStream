@@ -39,3 +39,44 @@ python -m src.run_infer \
     --max-seq-len 2048 \
     --prompt "What is the capital of France?" \
     --profile
+
+# Modal launchers are now GPU-agnostic: pass --gpu <type[:count]> before the "--" separator.
+# Supported examples: B200:1 (default), H100:1, H100:2, H200:1, A100-80GB:1, A100-40GB:1, L40S:1, L4:1, A10G:1, T4:1
+# HF_TOKEN is picked up from your shell env (sourced from ~/.bashrc) and forwarded as an ephemeral Modal Secret.
+# conda env used: `conda activate layerstream` (has modal==1.4.2 preinstalled).
+
+# -------- inference on an arbitrary GPU ----------
+modal run run_infer_b200.py --gpu B200:1 -- \
+    --model Qwen/Qwen2.5-14B-Instruct \
+    --mode layered \
+    --buffer-depth 2 \
+    --kv-cache-bits 16 \
+    --max-gpu-kv-gb 2.0 \
+    --max-seq-len 2048 \
+    --prompt "What is the capital of France?"
+
+modal run run_infer_b200.py --gpu H100:1 -- \
+    --model Qwen/Qwen2.5-14B-Instruct --mode layered --prompt "Hello"
+
+# Alternative: single-string arg form (avoids Modal "unexpected extra arguments" edge cases):
+modal run run_infer_b200.py --gpu A100-80GB:1 \
+    --infer-args "--model Qwen/Qwen2.5-14B-Instruct --mode layered --prompt 'Hello'"
+
+# -------- benchmark on an arbitrary GPU ----------
+modal run run_benchmark_b200.py --gpu H100:1 --benchmark-args "\
+    --dataset gpqa_diamond \
+    --batch-size 128 \
+    --model Qwen/Qwen2.5-14B-Instruct \
+    --mode layered \
+    --buffer-depth 2 \
+    --kv-cache-bits 16 \
+    --max-gpu-kv-gb 2.0 \
+    --max-seq-len 8192"
+
+modal run run_benchmark_b200.py --gpu H100:2 --benchmark-args \
+  "--dataset gpqa_diamond --batch-size 128 --model Qwen/Qwen2.5-14B-Instruct --mode layered"
+
+# -------- env-var form (useful in batch/SLURM scripts) ----------
+# export LAYERSTREAM_GPU=H100:1
+# export LAYERSTREAM_BENCHMARK_ARGS="--dataset gpqa_diamond --batch-size 128 --model Qwen/Qwen2.5-14B-Instruct --mode layered"
+# modal run run_benchmark_b200.py

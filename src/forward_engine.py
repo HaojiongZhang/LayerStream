@@ -63,11 +63,11 @@ class _SingleLayerCache(_CacheBase):  # type: ignore[misc]
 
     def get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:
         return self.max_seq_len - self._seen
-        import inspect
+
+
 from dataclasses import dataclass
 from typing import Any
 
-import torch
 import inspect
 from .gpu_buffer_pool import GPUBufferPool
 from .kv_manager import KVCacheManager
@@ -135,7 +135,7 @@ class ForwardEngine:
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-        seq_len = input_ids.shape[1]
+        batch, seq_len = input_ids.shape[0], input_ids.shape[1]
 
         past_len = self.kv_manager.current_seq_len
 
@@ -143,7 +143,7 @@ class ForwardEngine:
             past_len, past_len + seq_len,
             device=input_ids.device, dtype=torch.long,
         )
-        position_ids = cache_position.unsqueeze(0) 
+        position_ids = cache_position.unsqueeze(0).expand(batch, -1)
 
         if self.rotary_emb is not None:
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -276,7 +276,9 @@ class ForwardEngine:
 
         hidden_states = self.embed_tokens(input_ids)
 
-        pos_ids, cache_pos, pos_emb = self._make_position_info(hidden_states, input_ids)
+        pos_ids, cache_pos, pos_emb = self._make_position_info(
+            hidden_states, input_ids
+        )
         if position_ids is None:
             position_ids = pos_ids
 
@@ -342,7 +344,9 @@ class ForwardEngine:
 
         hidden_states = self.embed_tokens(input_ids)
 
-        pos_ids, cache_pos, pos_emb = self._make_position_info(hidden_states, input_ids)
+        pos_ids, cache_pos, pos_emb = self._make_position_info(
+            hidden_states, input_ids
+        )
         if position_ids is None:
             position_ids = pos_ids
 

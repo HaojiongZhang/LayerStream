@@ -12,8 +12,17 @@ from .timing import WallTimer
 
 @dataclass
 class GenerationResult:
-    text: str
-    generated_ids: list[int]
+    """``texts`` / ``generated_ids`` always length ``batch_size``."""
+
+    texts: list[str]
+    generated_ids: list[list[int]]
+
+    @property
+    def text(self) -> str:
+        """Single-row backward compatibility, or joined multi-row preview."""
+        if len(self.texts) == 1:
+            return self.texts[0]
+        return "\n---\n".join(f"[{i}] {t}" for i, t in enumerate(self.texts))
 
 
 class Generator:
@@ -24,12 +33,88 @@ class Generator:
         kv_manager: KVCacheManager,
         logger: ExperimentLogger,
         eos_token_id: int | None = None,
+        batch_size: int = 1,
     ) -> None:
         self.tokenizer = tokenizer
         self.engine = engine
         self.kv_manager = kv_manager
         self.logger = logger
         self.eos_token_id = eos_token_id
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self.batch_size = batch_size
+
+    def logits_after_prompt(
+        self,
+        request_id: int,
+        prompt: str,
+        *,
+        token_idx: int = 0,
+    ) -> torch.Tensor:
+        """
+        Single prompt: run one forward and return logits at the last prompt
+        position (shape ``[vocab]``).
+        """
+        self.kv_manager.reset_sequence()
+        enc = self.tokenizer(prompt, return_tensors="pt")
+        input_ids = enc["input_ids"].to("cuda")
+        attention_mask = enc.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to("cuda")
+
+        out = self.engine.forward_token(
+            request_id=request_id,
+            token_idx=token_idx,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=None,
+        )
+        torch.cuda.synchronize()
+        return out.logits[0, -1, :].detach()
+
+    def logits_after_prompts(
+        self,
+        request_id: int,
+        prompts: list[str],
+        *,
+        token_idx: int = 0,
+    ) -> torch.Tensor:
+        """
+        Batched prompts (possibly different lengths): right-padded tokenization,
+        one forward, logits at the last **non-pad** position per row. Returns
+        ``[B, vocab]``.
+        """
+        if not prompts:
+            raise ValueError("prompts must be non-empty")
+        self.kv_manager.reset_sequence()
+        tok = self.tokenizer
+        if tok.pad_token_id is None and len(prompts) > 1:
+            tok.pad_token_id = tok.eos_token_id
+        enc = tok(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            padding_side="right",
+        )
+        input_ids = enc["input_ids"].to("cuda")
+        attention_mask = enc.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, device="cuda")
+        else:
+            attention_mask = attention_mask.to("cuda")
+
+        out = self.engine.forward_token(
+            request_id=request_id,
+            token_idx=token_idx,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=None,
+        )
+        torch.cuda.synchronize()
+        logits_lm = out.logits
+        last_idx = attention_mask.sum(dim=1).clamp(min=1) - 1
+        b_idx = torch.arange(input_ids.shape[0], device=input_ids.device, dtype=torch.long)
+        return logits_lm[b_idx, last_idx, :].detach()
 
     @staticmethod
     def _gpu_mem_mb() -> tuple[float, float]:
@@ -42,20 +127,34 @@ class Generator:
         request_id: int,
         prompt: str,
         max_new_tokens: int = 64,
+        batch_size: int | None = None,
     ) -> GenerationResult:
-        enc = self.tokenizer(prompt, return_tensors="pt")
+        bs = self.batch_size if batch_size is None else batch_size
+        if bs < 1:
+            raise ValueError(f"batch_size must be >= 1, got {bs}")
+
+        prompts = [prompt] * bs
+        enc = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            padding_side="right",
+        )
         input_ids = enc["input_ids"].to("cuda")
         attention_mask = enc.get("attention_mask")
-        if attention_mask is not None:
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, device="cuda")
+        else:
             attention_mask = attention_mask.to("cuda")
 
-        generated_ids: list[int] = []
+        batch = int(input_ids.shape[0])
+        per_row_ids: list[list[int]] = [[] for _ in range(batch)]
         prompt_len = int(input_ids.shape[1])
 
         self.logger.log_request(
             request_id=request_id,
             event="start",
-            prompt=prompt,
+            prompt=prompt if batch == 1 else f"{prompt!r} (x{batch})",
             prompt_len=prompt_len,
         )
 
@@ -71,13 +170,15 @@ class Generator:
                 position_ids=None,
             )
 
-            next_token = int(torch.argmax(out.logits[:, -1, :], dim=-1).item())
-            generated_ids.append(next_token)
+            next_token = torch.argmax(out.logits[:, -1, :], dim=-1)
+            for b in range(batch):
+                per_row_ids[b].append(int(next_token[b].item()))
 
-            next_token_tensor = torch.tensor([[next_token]], device="cuda", dtype=input_ids.dtype)
-            input_ids = next_token_tensor
+            input_ids = next_token.unsqueeze(-1)
             if attention_mask is not None:
-                attention_mask = torch.ones((input_ids.shape[0], 1), device="cuda", dtype=attention_mask.dtype)
+                attention_mask = torch.ones(
+                    (batch, 1), device="cuda", dtype=attention_mask.dtype
+                )
 
             token_timer.stop()
             allocated_mb, reserved_mb = self._gpu_mem_mb()
@@ -85,7 +186,7 @@ class Generator:
             self.logger.log_token(
                 request_id=request_id,
                 token_idx=token_idx,
-                context_len=prompt_len + len(generated_ids),
+                context_len=prompt_len + len(per_row_ids[0]),
                 token_latency_ms=token_timer.elapsed_ms,
                 copy_total_ms=out.total_copy_ms,
                 compute_total_ms=out.total_compute_ms,
@@ -105,15 +206,19 @@ class Generator:
                 max_reserved_mb=torch.cuda.max_memory_reserved() / (1024 ** 2),
             )
 
-            if self.eos_token_id is not None and next_token == self.eos_token_id:
+            if self.eos_token_id is not None and bool(
+                (next_token == self.eos_token_id).all().item()
+            ):
                 break
 
-        text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        texts = [
+            self.tokenizer.decode(ids, skip_special_tokens=True) for ids in per_row_ids
+        ]
 
         self.logger.log_request(
             request_id=request_id,
             event="end",
-            generated_tokens=len(generated_ids),
-            final_text=text,
+            generated_tokens=len(per_row_ids[0]) * batch,
+            final_text=texts[0] if batch == 1 else "\n---\n".join(texts),
         )
-        return GenerationResult(text=text, generated_ids=generated_ids)
+        return GenerationResult(texts=texts, generated_ids=per_row_ids)

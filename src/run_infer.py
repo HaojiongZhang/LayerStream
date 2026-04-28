@@ -18,10 +18,75 @@ from .generation import Generator
 from .gpu_buffer_pool import GPUBufferPool
 from .kv_manager import KVCacheManager
 from .logger import ExperimentLogger
-from .model_loader import load_model_parts
+from .model_loader import LoadedModelParts, load_model_parts
 from .prefetcher import LayerPrefetcher
 from .profiler import Profiler
 from .streams import StreamManager
+
+
+def build_inference_stack(
+    *,
+    model_name_or_path: str,
+    mode: str,
+    dtype: str,
+    buffer_depth: int,
+    max_gpu_kv_gb: float,
+    kv_cache_bits: int,
+    max_seq_len: int,
+    log_dir: Path,
+    no_profile: bool,
+    batch_size: int = 1,
+) -> tuple[Generator, LoadedModelParts, ExperimentLogger, AppConfig, torch.dtype]:
+    """
+    Load weights, construct the forward engine + KV manager, and return a
+    ``Generator`` ready for ``generate()`` / ``logits_after_prompt()``.
+    """
+    cfg = AppConfig(
+        model=ModelConfig(
+            model_name_or_path=model_name_or_path,
+            dtype=dtype,
+        ),
+        offload=OffloadConfig(
+            buffer_depth=buffer_depth,
+            max_gpu_kv_bytes=int(max_gpu_kv_gb * 1024**3),
+            kv_cache_bits=kv_cache_bits,
+            vram_only=(mode == "vram"),
+            profile_cuda=not no_profile,
+        ),
+        generation=GenerationConfig(max_new_tokens=64, batch_size=batch_size),
+        logging=LoggingConfig(log_dir=log_dir),
+    )
+
+    logger = ExperimentLogger(cfg.logging.log_dir)
+    load_device = cfg.model.device if cfg.offload.vram_only else "cpu"
+    parts = load_model_parts(
+        cfg.model.model_name_or_path,
+        dtype=cfg.model.dtype,
+        device=load_device,
+    )
+    torch_dtype = getattr(torch, cfg.model.dtype)
+
+    if cfg.offload.vram_only:
+        engine, kv_manager = _build_vram_engine(parts, cfg, logger, max_seq_len)
+    else:
+        engine, kv_manager = _build_layered_engine(
+            parts,
+            cfg,
+            logger,
+            torch_dtype,
+            max_seq_len,
+        )
+
+    eos_id = parts.tokenizer.eos_token_id
+    generator = Generator(
+        tokenizer=parts.tokenizer,
+        engine=engine,
+        kv_manager=kv_manager,
+        logger=logger,
+        eos_token_id=eos_id,
+        batch_size=batch_size,
+    )
+    return generator, parts, logger, cfg, torch_dtype
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +114,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--prompt", default="Hello, I am a language model,")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        metavar="B",
+        help="Decode the same prompt in parallel on B rows (uniform batch).",
+    )
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument(
         "--dtype",
@@ -100,7 +172,10 @@ def parse_args() -> argparse.Namespace:
         default=20.0,
         help="Sampling rate for --profile (Hz).",
     )
-    return p.parse_args()
+    ns = p.parse_args()
+    if ns.batch_size < 1:
+        raise SystemExit("--batch-size must be >= 1")
+    return ns
 
 
 # ---------------------------------------------------------------------------
@@ -221,57 +296,24 @@ def _build_layered_engine(
 
 def main() -> None:
     args = parse_args()
-    cfg = AppConfig(
-        model=ModelConfig(
-            model_name_or_path=args.model,
-            dtype=args.dtype,
-        ),
-        offload=OffloadConfig(
-            buffer_depth=args.buffer_depth,
-            max_gpu_kv_bytes=int(args.max_gpu_kv_gb * 1024**3),
-            kv_cache_bits=args.kv_cache_bits,
-            vram_only=(args.mode == "vram"),
-            profile_cuda=not args.no_profile,
-        ),
-        generation=GenerationConfig(max_new_tokens=args.max_new_tokens),
-        logging=LoggingConfig(log_dir=Path(args.log_dir)),
-    )
-
     print(
-        f"Loading model: {cfg.model.model_name_or_path} "
-        f"(dtype={cfg.model.dtype}, mode={args.mode})"
+        f"Loading model: {args.model} "
+        f"(dtype={args.dtype}, mode={args.mode})"
     )
-    logger = ExperimentLogger(cfg.logging.log_dir)
-
-    # vram mode: load directly to GPU so weights never stage as a full copy in CPU RAM.
-    # layered mode: load to CPU so CPUWeightStore can pin them layer-by-layer.
-    load_device = cfg.model.device if cfg.offload.vram_only else "cpu"
-    parts = load_model_parts(
-        cfg.model.model_name_or_path,
-        dtype=cfg.model.dtype,
-        device=load_device,
+    generator, parts, logger, cfg, _torch_dtype = build_inference_stack(
+        model_name_or_path=args.model,
+        mode=args.mode,
+        dtype=args.dtype,
+        buffer_depth=args.buffer_depth,
+        max_gpu_kv_gb=args.max_gpu_kv_gb,
+        kv_cache_bits=args.kv_cache_bits,
+        max_seq_len=args.max_seq_len,
+        log_dir=Path(args.log_dir),
+        no_profile=args.no_profile,
+        batch_size=args.batch_size,
     )
-    torch_dtype = getattr(torch, cfg.model.dtype)
-
-    if cfg.offload.vram_only:
-        engine, kv_manager = _build_vram_engine(parts, cfg, logger, args.max_seq_len)
-    else:
-        engine, kv_manager = _build_layered_engine(
-            parts,
-            cfg,
-            logger,
-            torch_dtype,
-            args.max_seq_len,
-        )
-
-    eos_id = parts.tokenizer.eos_token_id
-    generator = Generator(
-        tokenizer=parts.tokenizer,
-        engine=engine,
-        kv_manager=kv_manager,
-        logger=logger,
-        eos_token_id=eos_id,
-    )
+    cfg.generation.max_new_tokens = args.max_new_tokens
+    cfg.generation.batch_size = args.batch_size
 
     print(f"Generating (mode={args.mode}, max_new_tokens={args.max_new_tokens}) …")
 
@@ -280,7 +322,7 @@ def main() -> None:
     if args.profile:
         profiler = Profiler(
             log_dir=cfg.logging.log_dir,
-            kv_manager=kv_manager,
+            kv_manager=generator.kv_manager,
             sample_hz=args.profile_hz,
             request_id=request_id,
         )
@@ -300,10 +342,17 @@ def main() -> None:
     print(result.text)
 
     if profiler is not None:
-        prompt_len = int(parts.tokenizer(args.prompt, return_tensors="pt")["input_ids"].shape[1])
+        enc = parts.tokenizer(
+            [args.prompt] * args.batch_size,
+            return_tensors="pt",
+            padding=True,
+            padding_side="right",
+        )
+        prompt_len = int(enc["input_ids"].shape[1])
+        gen_per_row = len(result.generated_ids[0]) if result.generated_ids else 0
         summary = profiler.summary(
             prompt_len=prompt_len,
-            generated_tokens=len(result.generated_ids),
+            generated_tokens=gen_per_row * args.batch_size,
         )
         profiler.write_summary(summary)
         profiler.print_summary(summary)

@@ -20,21 +20,39 @@ class LayerKV:
     ready_event: torch.cuda.Event | None = None
     quantized_bits: int = 16
 
-
-def _tensor_nbytes(x: torch.Tensor | None) -> int:
+def _tensor_storage_nbytes(x: torch.Tensor | None) -> int:
     if x is None:
         return 0
-    return x.numel() * x.element_size()
+    try:
+        return x.untyped_storage().nbytes()
+    except Exception:
+        return x.numel() * x.element_size()
+
+
+def _tensor_storage_id(x: torch.Tensor | None):
+    if x is None:
+        return None
+    try:
+        s = x.untyped_storage()
+        return (x.device.type, x.device.index, s.data_ptr())
+    except Exception:
+        return ("fallback", id(x))
 
 
 def _record_nbytes(rec: LayerKV) -> int:
-    return (
-        _tensor_nbytes(rec.key)
-        + _tensor_nbytes(rec.value)
-        + _tensor_nbytes(rec.key_scale)
-        + _tensor_nbytes(rec.value_scale)
-    )
+    total = 0
+    seen = set()
 
+    for x in (rec.key, rec.value, rec.key_scale, rec.value_scale):
+        if x is None:
+            continue
+        sid = _tensor_storage_id(x)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        total += _tensor_storage_nbytes(x)
+
+    return total
 
 def _quantize_tensor_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -146,6 +164,22 @@ class KVCacheManager:
         self.kv_cache_bits = kv_cache_bits
         self.layer_kv: list[LayerKV] = [LayerKV() for _ in range(num_layers)]
         self.current_seq_len = 0
+
+    def reset_sequence(self) -> None:
+        """Clear KV state so a new prompt can be processed from position 0."""
+        self.current_seq_len = 0
+        for rec in self.layer_kv:
+            rec.key = None
+            rec.value = None
+            rec.key_scale = None
+            rec.value_scale = None
+            rec.orig_dtype = None
+            rec.key_orig_shape = None
+            rec.value_orig_shape = None
+            rec.device = "none"
+            rec.bytes_total = 0
+            rec.ready_event = None
+            rec.quantized_bits = 16
 
     def _pin_if_needed(self, x: torch.Tensor | None) -> torch.Tensor | None:
         if x is None:

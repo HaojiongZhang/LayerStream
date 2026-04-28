@@ -31,6 +31,7 @@ class OffloadConfig:
 @dataclass
 class GenerationConfig:
     max_new_tokens: int = 64
+    batch_size: int = 1
     do_sample: bool = False
     temperature: float = 1.0
     top_p: float = 1.0

@@ -10,3 +10,6 @@ protobuf>=3.20.0          # sentencepiece dependency
 
 # HuggingFace auth (needed to download gated models like Llama-2)
 huggingface-hub>=0.22.0
+
+# Open benchmarks (GPQA, ARC, etc.) via ``python -m src.run_benchmark``
+datasets>=2.16.0
