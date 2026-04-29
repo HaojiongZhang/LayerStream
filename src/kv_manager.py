@@ -394,32 +394,6 @@ class KVCacheManager:
         self.layer_kv: list[LayerKV] = [LayerKV() for _ in range(num_layers)]
         self.current_seq_len = 0
 
-    def reset(self) -> None:
-        """Drop all per-layer KV state and reset the seq-len counter.
-
-        Call this between independent requests / batches so the next prefill
-        starts at position 0 with no stale K/V from prior runs. Without this,
-        ``current_seq_len`` keeps growing across requests and old K/V is fed
-        in as ``past_key_value``, corrupting subsequent generations.
-        """
-        for rec in self.layer_kv:
-            rec.key = None
-            rec.value = None
-            rec.key_scale = None
-            rec.value_scale = None
-            rec.orig_dtype = None
-            rec.key_orig_shape = None
-            rec.value_orig_shape = None
-            rec.device = "none"
-            rec.bytes_total = 0
-            rec.ready_event = None
-            rec.quantized_bits = 16
-            rec.key_quant_mode = None
-            rec.value_quant_mode = None
-            rec.key_quant_block_size = None
-            rec.value_quant_block_size = None
-        self.current_seq_len = 0
-
     def _pin_if_needed(self, x: torch.Tensor | None) -> torch.Tensor | None:
         if x is None:
             return None
