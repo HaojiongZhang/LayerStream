@@ -45,6 +45,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-seq-len", type=int, default=8192)
 
     p.add_argument("--num-samples", type=int, default=None)
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Process this many examples per generate_batch() call. "
+            "Requires uniform tokenized lengths across the batch (RULER NIAH "
+            "satisfies this). KV cache is reset between batches. "
+            "Default 1 preserves the original sequential behavior."
+        ),
+    )
     p.add_argument("--log-dir", default="logs")
     p.add_argument("--no-profile", action="store_true")
 
@@ -215,57 +226,114 @@ def main() -> None:
     rows = []
     num_correct = 0
 
-    try:
-        for i, ex in enumerate(examples):
-            prompt = get_prompt(ex)
-            answers = get_answers(ex)
+    if args.batch_size < 1:
+        raise SystemExit(f"--batch-size must be >= 1, got {args.batch_size}")
 
-            prompt_tokens = int(
-                parts.tokenizer(prompt, return_tensors="pt")["input_ids"].shape[1]
-            )
+    def _run_batch(batch_idx_start: int, batch: list[dict[str, Any]]) -> None:
+        """Run one batch (size 1..N) and append to rows / num_correct / prints."""
+        nonlocal num_correct
 
-            start = time.perf_counter()
+        prompts = [get_prompt(ex) for ex in batch]
+        answer_lists = [get_answers(ex) for ex in batch]
+        prompt_tokens_per_row = [
+            int(parts.tokenizer(p, return_tensors="pt")["input_ids"].shape[1])
+            for p in prompts
+        ]
 
-            result = generator.generate(
-                request_id=i + 1,
-                prompt=prompt,
+        # KV cache is shared across all forward calls within a batch and would
+        # otherwise carry stale state from the previous batch.
+        kv_manager.reset()
+
+        request_ids = [batch_idx_start + offset + 1 for offset in range(len(batch))]
+
+        start = time.perf_counter()
+
+        # generate_batch requires uniform prompt lengths — fall back to per-row
+        # generate() with reset between rows when lengths differ.
+        if len(set(prompt_tokens_per_row)) == 1 and len(batch) > 1:
+            results = generator.generate_batch(
+                request_ids=request_ids,
+                prompts=prompts,
                 max_new_tokens=args.max_new_tokens,
             )
+        elif len(batch) == 1:
+            results = [
+                generator.generate(
+                    request_id=request_ids[0],
+                    prompt=prompts[0],
+                    max_new_tokens=args.max_new_tokens,
+                )
+            ]
+        else:
+            print(
+                f"  [warn] mixed prompt lengths {prompt_tokens_per_row} in batch; "
+                "falling back to sequential generate() per row.",
+                flush=True,
+            )
+            results = []
+            for rid, p in zip(request_ids, prompts):
+                kv_manager.reset()
+                results.append(
+                    generator.generate(
+                        request_id=rid,
+                        prompt=p,
+                        max_new_tokens=args.max_new_tokens,
+                    )
+                )
 
-            elapsed = time.perf_counter() - start
+        elapsed = time.perf_counter() - start
 
+        # Per-row attribution: divide wall time evenly across rows for the
+        # latency_s column (real GPU work is shared, so per-row latency is an
+        # approximation regardless). tokens_per_s is computed batch-wide.
+        per_row_latency = elapsed / len(batch)
+        total_generated = sum(len(r.generated_ids) for r in results)
+        batch_tps = total_generated / elapsed if elapsed > 0 else 0.0
+
+        for offset, (ex, prompt_tokens, answers, result) in enumerate(
+            zip(batch, prompt_tokens_per_row, answer_lists, results)
+        ):
+            i = batch_idx_start + offset
             prediction = result.text
             generated_tokens = len(result.generated_ids)
             correct = exact_match(prediction, answers)
-
             num_correct += int(correct)
 
-            row = {
-                "task": args.task,
-                "sample_id": i,
-                "model": args.model,
-                "mode": args.mode,
-                "dtype": args.dtype,
-                "kv_cache_bits": args.kv_cache_bits,
-                "max_seq_len": args.max_seq_len,
-                "prompt_tokens": prompt_tokens,
-                "generated_tokens": generated_tokens,
-                "latency_s": elapsed,
-                "tokens_per_s": generated_tokens / elapsed if elapsed > 0 else 0.0,
-                "correct": int(correct),
-                "prediction": prediction,
-                "answers": json.dumps(answers, ensure_ascii=False),
-            }
-
-            rows.append(row)
+            rows.append(
+                {
+                    "task": args.task,
+                    "sample_id": i,
+                    "model": args.model,
+                    "mode": args.mode,
+                    "dtype": args.dtype,
+                    "kv_cache_bits": args.kv_cache_bits,
+                    "max_seq_len": args.max_seq_len,
+                    "batch_size": args.batch_size,
+                    "prompt_tokens": prompt_tokens,
+                    "generated_tokens": generated_tokens,
+                    "latency_s": per_row_latency,
+                    "batch_latency_s": elapsed,
+                    "tokens_per_s": batch_tps,
+                    "correct": int(correct),
+                    "prediction": prediction,
+                    "answers": json.dumps(answers, ensure_ascii=False),
+                }
+            )
 
             print(
                 f"[{i + 1}/{len(examples)}] "
+                f"batch={len(batch)} "
                 f"correct={correct} "
                 f"prompt_tokens={prompt_tokens} "
                 f"gen_tokens={generated_tokens} "
-                f"latency={elapsed:.2f}s"
+                f"batch_latency={elapsed:.2f}s "
+                f"batch_tps={batch_tps:.2f}"
             )
+
+    try:
+        for batch_start in range(0, len(examples), args.batch_size):
+            batch = examples[batch_start : batch_start + args.batch_size]
+            _run_batch(batch_start, batch)
 
     finally:
         if profiler is not None:
@@ -277,6 +345,7 @@ def main() -> None:
     print(f"Task: {args.task}")
     print(f"KV cache bits: {args.kv_cache_bits}")
     print(f"Max seq len: {args.max_seq_len}")
+    print(f"Batch size: {args.batch_size}")
     print(f"Examples: {len(examples)}")
     print(f"Correct: {num_correct}")
     print(f"Accuracy: {accuracy:.4f}")

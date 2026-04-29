@@ -65,3 +65,112 @@ python -m src.mem_trace \
  python -m src.mem_trace   --log logs/debug_mem_trace/mem_trace.log
 
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m src.run_ruler_eval   --model meta-llama/Llama-2-13b-chat-hf   --mode layered   --dataset-path ./ruler_data/niah_single_1_4096.jsonl   --task niah_single_1   --kv-cache-bits 16   --max-seq-len 4096   --max-new-tokens 20   --num-samples 1   --max-gpu-kv-gb 0.5   --buffer-depth 1   --no-profile   --log-dir logs/debug_mem_trace 2>&1 | tee logs/debug_mem_trace/mem_trace.log
+
+
+# =====================================================================
+# RULER niah_single_1 — dataset generation (one-time, runs locally in
+# the `layerstream` conda env). Outputs ruler_data/niah_single_1_4096.jsonl
+# which the eval commands above and the modal commands below consume.
+# =====================================================================
+
+# 1) clone NVIDIA RULER + install deps (one-time)
+git clone --depth=1 https://github.com/NVIDIA/RULER.git
+pip install wonderwords nltk html2text beautifulsoup4 tenacity
+python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
+
+# 2) download Paul Graham essay haystack corpus (one-time, ~3 MB)
+( cd RULER/scripts/data/synthetic/json && python download_paulgraham_essay.py )
+
+# 3) generate niah_single_1 at 4096 tokens, 20 samples
+( cd RULER/scripts/data && python prepare.py \
+    --save_dir /jet/home/fxiang1/project/15642/LayerStream/ruler_data \
+    --benchmark synthetic \
+    --task niah_single_1 \
+    --tokenizer_path meta-llama/Llama-2-13b-chat-hf \
+    --tokenizer_type hf \
+    --max_seq_length 4096 \
+    --model_template_type base \
+    --num_samples 20 )
+cp ruler_data/niah_single_1/validation.jsonl ruler_data/niah_single_1_4096.jsonl
+
+
+# =====================================================================
+# Modal cloud GPU runs — wraps `python -m src.run_ruler_eval` on a remote
+# H100/B200. HF_TOKEN is forwarded automatically; LAYERSTREAM_HF_CACHE_VOLUME
+# persists model weights across runs so 13B isn't re-downloaded.
+# =====================================================================
+
+# one-time: install + auth modal
+pip install modal && modal setup
+
+# (optional) override default volume names. Defaults are already
+# LAYERSTREAM_HF_CACHE_VOLUME=hf-cache and LAYERSTREAM_LOGS_VOLUME=layerstream-logs
+# so the exports below are only needed if you want different volume names.
+# export LAYERSTREAM_HF_CACHE_VOLUME=hf-cache
+# export LAYERSTREAM_LOGS_VOLUME=layerstream-logs
+
+# smoke test: 4096 ctx, 1 sample, batch=1
+modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args "--model meta-llama/Llama-2-13b-chat-hf --mode layered --dataset-path ./ruler_data/niah_single_1_4096.jsonl --task niah_single_1 --kv-cache-bits 16 --max-seq-len 4096 --max-new-tokens 64 --num-samples 1 --batch-size 1 --profile --log-dir logs/ruler_niah_single_1_4096_kv16"
+
+# full run: 8192 ctx budget, 20 samples, batch=4
+modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args "--model meta-llama/Llama-2-13b-chat-hf --mode layered --dataset-path ./ruler_data/niah_single_1_4096.jsonl --task niah_single_1 --kv-cache-bits 16 --max-seq-len 8192 --max-new-tokens 64 --num-samples 20 --batch-size 4 --profile --log-dir logs/ruler_niah_single_1_8192_kv16"
+
+# batched: 4 samples per generate_batch() call, KV reset between batches.
+# RULER NIAH prompts are uniform-length, so batching is safe. For mixed-
+# length datasets the eval falls back to sequential generate() per row.
+modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args "--model meta-llama/Llama-2-13b-chat-hf --mode layered --dataset-path ./ruler_data/niah_single_1_4096.jsonl --task niah_single_1 --kv-cache-bits 16 --max-seq-len 4096 --max-new-tokens 64 --num-samples 20 --batch-size 4 --profile --log-dir logs/ruler_niah_single_1_4096_kv16_b4"
+
+# alternative: pass eval flags after `--` instead of via --eval-args (smoke, batch=1)
+modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 16 --max-seq-len 4096 \
+   --max-new-tokens 64 --num-samples 1 --batch-size 1 --profile \
+   --log-dir logs/ruler_niah_single_1_4096_kv16"
+
+# layered, kv4, 8192 ctx, 20 samples, batch=4
+modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 4 --max-seq-len 8192 \
+   --max-new-tokens 64 --num-samples 20 --batch-size 4 --profile \
+   --log-dir logs/ruler_niah_single_1_8192_kv4_b4"
+
+# layered, kv4, 4096 ctx, 20 samples, batch=4
+modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
+   --max-new-tokens 64 --num-samples 20 --batch-size 8 --profile \
+   --log-dir logs/ruler_niah_single_20_4096_kv4_b4"
+
+# vram, kv4, 4096 ctx, 20 samples, batch=4
+modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode vram \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
+   --max-new-tokens 64 --num-samples 20 --batch-size 4 --profile \
+   --log-dir logs/ruler_niah_single_20_4096_kv4_vram_b4"
+
+# alternative: pin GPU type via env (avoids re-typing --gpu); vram smoke, batch=1
+LAYERSTREAM_GPU=A100-80GB:1 modal run run_ruler_eval_b200.py --eval-args "--model meta-llama/Llama-2-13b-chat-hf --mode vram --dataset-path ./ruler_data/niah_single_1_4096.jsonl --task niah_single_1 --kv-cache-bits 16 --max-seq-len 4096 --max-new-tokens 64 --num-samples 1 --batch-size 1 --profile --log-dir logs/ruler_vram_4096"
+
+
+# =====================================================================
+# Retrieve logs / profile artifacts from the Modal Volume after a run.
+# Modal logs (--log-dir logs/...) write into the layerstream-logs Volume,
+# not your local disk — pull them down explicitly.
+# =====================================================================
+
+# inspect what's on the volume
+modal volume ls layerstream-logs /
+modal volume ls layerstream-logs /ruler_niah_single_1_4096_kv16
+
+# pull a specific run's directory back to local
+modal volume get layerstream-logs ruler_niah_single_1_4096_kv16 ./logs/
+
+# pull everything
+modal volume get layerstream-logs / ./logs_remote/
+
+# delete an old run directory on the volume
+# modal volume rm -r layerstream-logs ruler_niah_single_1_4096_kv16
