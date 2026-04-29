@@ -6,6 +6,10 @@ import torch
 import torch.nn.functional as F
 
 
+KEY_QUANT_MODE_SEQ_CHANNEL = "seq_channel"
+VALUE_QUANT_MODE_HEAD_BLOCK = "head_block"
+
+
 @dataclass
 class LayerKV:
     key: torch.Tensor | None = None
@@ -20,91 +24,293 @@ class LayerKV:
     ready_event: torch.cuda.Event | None = None
     quantized_bits: int = 16
 
-def _tensor_storage_nbytes(x: torch.Tensor | None) -> int:
+    # K and V intentionally use different block layouts.
+    #   K: one scale per channel over a block of sequence positions.
+    #   V: one scale per token over a block of head-dimension channels.
+    key_quant_mode: str | None = None
+    value_quant_mode: str | None = None
+    key_quant_block_size: int | None = None
+    value_quant_block_size: int | None = None
+
+
+def _tensor_nbytes(x: torch.Tensor | None) -> int:
     if x is None:
         return 0
-    try:
-        return x.untyped_storage().nbytes()
-    except Exception:
-        return x.numel() * x.element_size()
-
-
-def _tensor_storage_id(x: torch.Tensor | None):
-    if x is None:
-        return None
-    try:
-        s = x.untyped_storage()
-        return (x.device.type, x.device.index, s.data_ptr())
-    except Exception:
-        return ("fallback", id(x))
+    return x.numel() * x.element_size()
 
 
 def _record_nbytes(rec: LayerKV) -> int:
-    total = 0
-    seen = set()
+    return (
+        _tensor_nbytes(rec.key)
+        + _tensor_nbytes(rec.value)
+        + _tensor_nbytes(rec.key_scale)
+        + _tensor_nbytes(rec.value_scale)
+    )
 
-    for x in (rec.key, rec.value, rec.key_scale, rec.value_scale):
-        if x is None:
-            continue
-        sid = _tensor_storage_id(x)
-        if sid in seen:
-            continue
-        seen.add(sid)
-        total += _tensor_storage_nbytes(x)
 
-    return total
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
-def _quantize_tensor_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+
+def _effective_block_size(dim_size: int, block_size: int) -> int:
+    if block_size <= 0:
+        raise ValueError(f"quant block size must be positive, got {block_size}")
+    return min(block_size, dim_size)
+
+
+# -----------------------------------------------------------------------------
+# V quantization: per-token, head-dimension blocks.
+# Tensor shape convention: [..., seq_len, head_dim]
+# For standard HF KV cache this is usually [batch, num_heads, seq_len, head_dim].
+# -----------------------------------------------------------------------------
+
+
+def _pad_last_dim_to_multiple(x: torch.Tensor, multiple: int) -> torch.Tensor:
+    pad = (-x.shape[-1]) % multiple
+    if pad == 0:
+        return x
+    return F.pad(x, (0, pad), mode="constant", value=0)
+
+
+def _head_block_view(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    """View a [..., padded_head_dim] tensor as [..., num_blocks, block_size]."""
+    return x.reshape(*x.shape[:-1], x.shape[-1] // block_size, block_size)
+
+
+def _quantize_tensor_int8_head_block(
+    x: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
     """
-    Symmetric per-vector int8 quantization along the last dimension.
+    Symmetric int8 quantization over contiguous head-dimension blocks.
 
-    For LLM KV cache tensors this is typically applied to tensors shaped like:
-        [batch, num_heads, seq_len, head_dim]
+    This is the recommended V-cache path: values are quantized per token, with
+    each token vector split into smaller head-dimension blocks.
 
-    The scale is therefore shaped like:
-        [batch, num_heads, seq_len, 1]
-
-    Quantization is performed on the tensor's current device, so this works for
-    both CPU and GPU tensors.
+    Returns:
+        q:          int8 tensor in the original shape
+        scale:      float32 tensor shaped [..., num_head_blocks, 1]
+        orig_shape: original tensor shape for dequantization
     """
     x_detached = x.detach()
-    max_abs = x_detached.abs().amax(dim=-1, keepdim=True)
+    orig_shape = tuple(x_detached.shape)
+    bsz = _effective_block_size(orig_shape[-1], block_size)
+
+    x_padded = _pad_last_dim_to_multiple(x_detached, bsz)
+    x_blocks = _head_block_view(x_padded, bsz)
+
+    max_abs = x_blocks.abs().amax(dim=-1, keepdim=True)
     scale = (max_abs / 127.0).clamp_min(1e-8).to(torch.float32)
-    q = torch.round(x_detached / scale).clamp_(-127, 127).to(torch.int8)
-    return q, scale
+    q_blocks = torch.round(x_blocks / scale).clamp_(-127, 127).to(torch.int8)
+    q_padded = q_blocks.reshape(*x_padded.shape)
+    q = q_padded[..., : orig_shape[-1]].reshape(orig_shape)
+    return q, scale, orig_shape
 
 
-
-def _dequantize_tensor_int8(
+def _dequantize_tensor_int8_head_block(
     q: torch.Tensor,
     scale: torch.Tensor,
     dtype: torch.dtype,
     device: str | torch.device,
+    orig_shape: tuple[int, ...],
+    block_size: int,
 ) -> torch.Tensor:
     q_dev = q.to(device, non_blocking=True)
-    s_dev = scale.to(device, non_blocking=True)
-    return (q_dev.to(torch.float32) * s_dev).to(dtype)
+    scale_dev = scale.to(device, non_blocking=True)
+
+    bsz = _effective_block_size(orig_shape[-1], block_size)
+    q_padded = _pad_last_dim_to_multiple(q_dev, bsz)
+    q_blocks = _head_block_view(q_padded, bsz)
+    deq_blocks = q_blocks.to(torch.float32) * scale_dev
+    deq_padded = deq_blocks.reshape(*q_padded.shape)
+    deq = deq_padded[..., : orig_shape[-1]].reshape(orig_shape)
+    return deq.to(dtype)
 
 
-
-def _quantize_tensor_int4(
+def _quantize_tensor_int4_head_block(
     x: torch.Tensor,
+    block_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
     """
-    Symmetric per-vector packed int4 quantization along the last dimension.
+    Symmetric packed int4 quantization over contiguous head-dimension blocks.
 
     Returns:
-        packed: uint8 tensor containing two signed int4 values per byte
-        scale:  float32 tensor shaped [..., 1]
+        packed:     uint8 tensor containing two signed int4 values per byte
+        scale:      float32 tensor shaped [..., num_head_blocks, 1]
         orig_shape: original tensor shape needed for unpacking/dequantization
     """
     x_detached = x.detach()
     orig_shape = tuple(x_detached.shape)
+    bsz = _effective_block_size(orig_shape[-1], block_size)
 
-    max_abs = x_detached.abs().amax(dim=-1, keepdim=True)
+    x_padded = _pad_last_dim_to_multiple(x_detached, bsz)
+    x_blocks = _head_block_view(x_padded, bsz)
+
+    max_abs = x_blocks.abs().amax(dim=-1, keepdim=True)
     scale = (max_abs / 7.0).clamp_min(1e-8).to(torch.float32)
-    q = torch.round(x_detached / scale).clamp_(-8, 7).to(torch.int8)
+    q_blocks = torch.round(x_blocks / scale).clamp_(-8, 7).to(torch.int8)
+    q_padded = q_blocks.reshape(*x_padded.shape)
 
+    # Packing needs an even number of int4 entries.
+    if q_padded.shape[-1] % 2 != 0:
+        q_padded = F.pad(q_padded, (0, 1), mode="constant", value=0)
+
+    q_i16 = q_padded.to(torch.int16)
+    low = (q_i16[..., 0::2] & 0x0F).to(torch.uint8)
+    high = ((q_i16[..., 1::2] & 0x0F) << 4).to(torch.uint8)
+    packed = low | high
+    return packed, scale, orig_shape
+
+
+def _unpack_signed_int4(packed: torch.Tensor) -> torch.Tensor:
+    packed_i16 = packed.to(torch.int16)
+    low = packed_i16 & 0x0F
+    high = (packed_i16 >> 4) & 0x0F
+
+    low = torch.where(low >= 8, low - 16, low)
+    high = torch.where(high >= 8, high - 16, high)
+
+    return torch.stack((low, high), dim=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * 2
+    )
+
+
+def _dequantize_tensor_int4_head_block(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    dtype: torch.dtype,
+    device: str | torch.device,
+    orig_shape: tuple[int, ...],
+    block_size: int,
+) -> torch.Tensor:
+    packed_dev = packed.to(device, non_blocking=True)
+    scale_dev = scale.to(device, non_blocking=True)
+
+    unpacked = _unpack_signed_int4(packed_dev)
+
+    bsz = _effective_block_size(orig_shape[-1], block_size)
+    padded_last_dim = _ceil_div(orig_shape[-1], bsz) * bsz
+    unpacked = unpacked[..., :padded_last_dim]
+
+    q_blocks = _head_block_view(unpacked, bsz)
+    deq_blocks = q_blocks.to(torch.float32) * scale_dev
+    deq_padded = deq_blocks.reshape(*unpacked.shape)
+    deq = deq_padded[..., : orig_shape[-1]].reshape(orig_shape)
+    return deq.to(dtype)
+
+
+# -----------------------------------------------------------------------------
+# K quantization: per-channel, sequence blocks.
+# Tensor shape convention: [..., seq_len, head_dim]
+# This creates one scale for each channel over a block of sequence positions.
+# -----------------------------------------------------------------------------
+
+
+def _pad_seq_dim_to_multiple(x: torch.Tensor, multiple: int) -> torch.Tensor:
+    """Pad the second-to-last dimension: [..., seq_len, head_dim]."""
+    pad = (-x.shape[-2]) % multiple
+    if pad == 0:
+        return x
+    return F.pad(x, (0, 0, 0, pad), mode="constant", value=0)
+
+
+def _slice_seq_dim(x: torch.Tensor, seq_len: int) -> torch.Tensor:
+    """Slice the second-to-last dimension: [..., seq_len, head_dim]."""
+    return x[..., :seq_len, :]
+
+
+def _seq_channel_block_view(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    """
+    View [..., padded_seq_len, head_dim] as
+    [..., num_seq_blocks, block_size, head_dim].
+    """
+    return x.reshape(
+        *x.shape[:-2],
+        x.shape[-2] // block_size,
+        block_size,
+        x.shape[-1],
+    )
+
+
+def _quantize_tensor_int8_seq_channel(
+    x: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    """
+    Symmetric int8 K-cache quantization: per channel over sequence blocks.
+
+    For x shaped [B, H, S, D], scale is shaped [B, H, S_blocks, 1, D].
+    This reduces the effect of key-channel outliers versus quantizing each full
+    token vector with one scale.
+    """
+    if x.ndim < 2:
+        raise ValueError("sequence/channel quantization expects at least 2 dims")
+
+    x_detached = x.detach()
+    orig_shape = tuple(x_detached.shape)
+    bsz = _effective_block_size(orig_shape[-2], block_size)
+
+    x_padded = _pad_seq_dim_to_multiple(x_detached, bsz)
+    x_blocks = _seq_channel_block_view(x_padded, bsz)
+
+    max_abs = x_blocks.abs().amax(dim=-2, keepdim=True)
+    scale = (max_abs / 127.0).clamp_min(1e-8).to(torch.float32)
+    q_blocks = torch.round(x_blocks / scale).clamp_(-127, 127).to(torch.int8)
+    q_padded = q_blocks.reshape(*x_padded.shape)
+    q = _slice_seq_dim(q_padded, orig_shape[-2]).reshape(orig_shape)
+    return q, scale, orig_shape
+
+
+def _dequantize_tensor_int8_seq_channel(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    dtype: torch.dtype,
+    device: str | torch.device,
+    orig_shape: tuple[int, ...],
+    block_size: int,
+) -> torch.Tensor:
+    q_dev = q.to(device, non_blocking=True)
+    scale_dev = scale.to(device, non_blocking=True)
+
+    bsz = _effective_block_size(orig_shape[-2], block_size)
+    q_padded = _pad_seq_dim_to_multiple(q_dev, bsz)
+    q_blocks = _seq_channel_block_view(q_padded, bsz)
+    deq_blocks = q_blocks.to(torch.float32) * scale_dev
+    deq_padded = deq_blocks.reshape(*q_padded.shape)
+    deq = _slice_seq_dim(deq_padded, orig_shape[-2]).reshape(orig_shape)
+    return deq.to(dtype)
+
+
+def _quantize_tensor_int4_seq_channel(
+    x: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    """
+    Symmetric packed int4 K-cache quantization: per channel over sequence blocks.
+
+    For x shaped [B, H, S, D], scale is shaped [B, H, S_blocks, 1, D].
+    The int4 values are still byte-packed along head_dim for compact storage.
+    """
+    if x.ndim < 2:
+        raise ValueError("sequence/channel quantization expects at least 2 dims")
+
+    x_detached = x.detach()
+    orig_shape = tuple(x_detached.shape)
+    bsz = _effective_block_size(orig_shape[-2], block_size)
+
+    x_padded = _pad_seq_dim_to_multiple(x_detached, bsz)
+    x_blocks = _seq_channel_block_view(x_padded, bsz)
+
+    max_abs = x_blocks.abs().amax(dim=-2, keepdim=True)
+    scale = (max_abs / 7.0).clamp_min(1e-8).to(torch.float32)
+    q_blocks = torch.round(x_blocks / scale).clamp_(-8, 7).to(torch.int8)
+    q_padded = q_blocks.reshape(*x_padded.shape)
+
+    # Store only the real sequence positions; dequantization pads the sequence
+    # dimension back to a multiple of the K block size before applying scales.
+    q = _slice_seq_dim(q_padded, orig_shape[-2]).reshape(orig_shape)
+
+    # Packing is still along the head/channel dimension.
     if q.shape[-1] % 2 != 0:
         q = F.pad(q, (0, 1), mode="constant", value=0)
 
@@ -115,31 +321,28 @@ def _quantize_tensor_int4(
     return packed, scale, orig_shape
 
 
-
-def _dequantize_tensor_int4(
+def _dequantize_tensor_int4_seq_channel(
     packed: torch.Tensor,
     scale: torch.Tensor,
     dtype: torch.dtype,
     device: str | torch.device,
     orig_shape: tuple[int, ...],
+    block_size: int,
 ) -> torch.Tensor:
     packed_dev = packed.to(device, non_blocking=True)
     scale_dev = scale.to(device, non_blocking=True)
 
-    packed_i16 = packed_dev.to(torch.int16)
-    low = packed_i16 & 0x0F
-    high = (packed_i16 >> 4) & 0x0F
-
-    low = torch.where(low >= 8, low - 16, low)
-    high = torch.where(high >= 8, high - 16, high)
-
-    unpacked = torch.stack((low, high), dim=-1).reshape(
-        *packed_dev.shape[:-1], packed_dev.shape[-1] * 2
-    )
+    unpacked = _unpack_signed_int4(packed_dev)
     unpacked = unpacked[..., : orig_shape[-1]]
-    unpacked = unpacked.reshape(orig_shape)
 
-    return (unpacked.to(torch.float32) * scale_dev).to(dtype)
+    bsz = _effective_block_size(orig_shape[-2], block_size)
+    q_padded = _pad_seq_dim_to_multiple(unpacked, bsz)
+    q_blocks = _seq_channel_block_view(q_padded, bsz)
+
+    deq_blocks = q_blocks.to(torch.float32) * scale_dev
+    deq_padded = deq_blocks.reshape(*q_padded.shape)
+    deq = _slice_seq_dim(deq_padded, orig_shape[-2]).reshape(orig_shape)
+    return deq.to(dtype)
 
 
 class KVCacheManager:
@@ -151,10 +354,20 @@ class KVCacheManager:
         enable_cpu_offload: bool = True,
         pin_cpu_memory: bool = True,
         kv_cache_bits: int = 16,
+        # Backward-compatible default. If the K/V-specific block sizes below are
+        # not supplied, both use this value.
+        kv_quant_block_size: int = 32,
+        # Asymmetric K/V defaults.
+        k_seq_block_size: int | None = None,
+        v_head_block_size: int | None = None,
     ) -> None:
         if kv_cache_bits not in (4, 8, 16):
             raise ValueError(
                 f"Unsupported kv_cache_bits={kv_cache_bits}; expected 4, 8 or 16"
+            )
+        if kv_quant_block_size <= 0:
+            raise ValueError(
+                f"Unsupported kv_quant_block_size={kv_quant_block_size}; expected > 0"
             )
 
         self.max_gpu_kv_bytes = max_gpu_kv_bytes
@@ -162,24 +375,24 @@ class KVCacheManager:
         self.enable_cpu_offload = enable_cpu_offload
         self.pin_cpu_memory = pin_cpu_memory
         self.kv_cache_bits = kv_cache_bits
+
+        self.k_seq_block_size = (
+            kv_quant_block_size if k_seq_block_size is None else k_seq_block_size
+        )
+        self.v_head_block_size = (
+            kv_quant_block_size if v_head_block_size is None else v_head_block_size
+        )
+        if self.k_seq_block_size <= 0:
+            raise ValueError(
+                f"Unsupported k_seq_block_size={self.k_seq_block_size}; expected > 0"
+            )
+        if self.v_head_block_size <= 0:
+            raise ValueError(
+                f"Unsupported v_head_block_size={self.v_head_block_size}; expected > 0"
+            )
+
         self.layer_kv: list[LayerKV] = [LayerKV() for _ in range(num_layers)]
         self.current_seq_len = 0
-
-    def reset_sequence(self) -> None:
-        """Clear KV state so a new prompt can be processed from position 0."""
-        self.current_seq_len = 0
-        for rec in self.layer_kv:
-            rec.key = None
-            rec.value = None
-            rec.key_scale = None
-            rec.value_scale = None
-            rec.orig_dtype = None
-            rec.key_orig_shape = None
-            rec.value_orig_shape = None
-            rec.device = "none"
-            rec.bytes_total = 0
-            rec.ready_event = None
-            rec.quantized_bits = 16
 
     def _pin_if_needed(self, x: torch.Tensor | None) -> torch.Tensor | None:
         if x is None:
@@ -188,39 +401,151 @@ class KVCacheManager:
             return x.pin_memory()
         return x
 
-    def _quantize_record_in_place(self, rec: LayerKV) -> None:
-        if rec.key is None or rec.value is None:
-            return
-        if rec.quantized_bits == self.kv_cache_bits:
-            return
+    def _record_matches_current_quant_config(self, rec: LayerKV) -> bool:
+        if rec.quantized_bits != self.kv_cache_bits:
+            return False
+        if self.kv_cache_bits == 16:
+            return True
+        return (
+            rec.key_quant_mode == KEY_QUANT_MODE_SEQ_CHANNEL
+            and rec.value_quant_mode == VALUE_QUANT_MODE_HEAD_BLOCK
+            and rec.key_quant_block_size == self.k_seq_block_size
+            and rec.value_quant_block_size == self.v_head_block_size
+        )
+
+    def _materialize_record(self, rec: LayerKV) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return dequantized key/value on the record's current device."""
+        assert rec.key is not None and rec.value is not None
+        if rec.quantized_bits == 16:
+            return rec.key, rec.value
+        if rec.orig_dtype is None:
+            raise RuntimeError("Cannot materialize quantized KV without orig_dtype")
+        if rec.key_orig_shape is None or rec.value_orig_shape is None:
+            raise RuntimeError("Cannot materialize quantized KV without original shapes")
+        if rec.key_quant_block_size is None or rec.value_quant_block_size is None:
+            raise RuntimeError("Cannot materialize quantized KV without block sizes")
+        if rec.key_quant_mode != KEY_QUANT_MODE_SEQ_CHANNEL:
+            raise RuntimeError(f"Unsupported key_quant_mode={rec.key_quant_mode}")
+        if rec.value_quant_mode != VALUE_QUANT_MODE_HEAD_BLOCK:
+            raise RuntimeError(f"Unsupported value_quant_mode={rec.value_quant_mode}")
+
+        if rec.quantized_bits == 8:
+            assert rec.key_scale is not None and rec.value_scale is not None
+            key = _dequantize_tensor_int8_seq_channel(
+                rec.key,
+                rec.key_scale,
+                rec.orig_dtype,
+                rec.key.device,
+                rec.key_orig_shape,
+                rec.key_quant_block_size,
+            )
+            value = _dequantize_tensor_int8_head_block(
+                rec.value,
+                rec.value_scale,
+                rec.orig_dtype,
+                rec.value.device,
+                rec.value_orig_shape,
+                rec.value_quant_block_size,
+            )
+            return key, value
+
+        if rec.quantized_bits == 4:
+            assert rec.key_scale is not None and rec.value_scale is not None
+            key = _dequantize_tensor_int4_seq_channel(
+                rec.key,
+                rec.key_scale,
+                rec.orig_dtype,
+                rec.key.device,
+                rec.key_orig_shape,
+                rec.key_quant_block_size,
+            )
+            value = _dequantize_tensor_int4_head_block(
+                rec.value,
+                rec.value_scale,
+                rec.orig_dtype,
+                rec.value.device,
+                rec.value_orig_shape,
+                rec.value_quant_block_size,
+            )
+            return key, value
+
+        raise RuntimeError(f"Unsupported rec.quantized_bits={rec.quantized_bits}")
+
+    def _store_quantized_record(
+        self,
+        rec: LayerKV,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        pin_cpu_result: bool,
+    ) -> None:
+        rec.orig_dtype = key.dtype
+        rec.key_orig_shape = tuple(key.shape)
+        rec.value_orig_shape = tuple(value.shape)
 
         if self.kv_cache_bits == 8:
-            qk, sk = _quantize_tensor_int8(rec.key)
-            qv, sv = _quantize_tensor_int8(rec.value)
-            rec.key = self._pin_if_needed(qk)
-            rec.value = self._pin_if_needed(qv)
-            rec.key_scale = self._pin_if_needed(sk)
-            rec.value_scale = self._pin_if_needed(sv)
-            rec.key_orig_shape = tuple(rec.key.shape)
-            rec.value_orig_shape = tuple(rec.value.shape)
+            qk, sk, kshape = _quantize_tensor_int8_seq_channel(
+                key, self.k_seq_block_size
+            )
+            qv, sv, vshape = _quantize_tensor_int8_head_block(
+                value, self.v_head_block_size
+            )
+            rec.key = self._pin_if_needed(qk) if pin_cpu_result else qk
+            rec.value = self._pin_if_needed(qv) if pin_cpu_result else qv
+            rec.key_scale = self._pin_if_needed(sk) if pin_cpu_result else sk
+            rec.value_scale = self._pin_if_needed(sv) if pin_cpu_result else sv
+            rec.key_orig_shape = kshape
+            rec.value_orig_shape = vshape
             rec.quantized_bits = 8
+            rec.key_quant_mode = KEY_QUANT_MODE_SEQ_CHANNEL
+            rec.value_quant_mode = VALUE_QUANT_MODE_HEAD_BLOCK
+            rec.key_quant_block_size = self.k_seq_block_size
+            rec.value_quant_block_size = self.v_head_block_size
         elif self.kv_cache_bits == 4:
-            qk, sk, kshape = _quantize_tensor_int4(rec.key)
-            qv, sv, vshape = _quantize_tensor_int4(rec.value)
-            rec.key = self._pin_if_needed(qk)
-            rec.value = self._pin_if_needed(qv)
-            rec.key_scale = self._pin_if_needed(sk)
-            rec.value_scale = self._pin_if_needed(sv)
+            qk, sk, kshape = _quantize_tensor_int4_seq_channel(
+                key, self.k_seq_block_size
+            )
+            qv, sv, vshape = _quantize_tensor_int4_head_block(
+                value, self.v_head_block_size
+            )
+            rec.key = self._pin_if_needed(qk) if pin_cpu_result else qk
+            rec.value = self._pin_if_needed(qv) if pin_cpu_result else qv
+            rec.key_scale = self._pin_if_needed(sk) if pin_cpu_result else sk
+            rec.value_scale = self._pin_if_needed(sv) if pin_cpu_result else sv
             rec.key_orig_shape = kshape
             rec.value_orig_shape = vshape
             rec.quantized_bits = 4
+            rec.key_quant_mode = KEY_QUANT_MODE_SEQ_CHANNEL
+            rec.value_quant_mode = VALUE_QUANT_MODE_HEAD_BLOCK
+            rec.key_quant_block_size = self.k_seq_block_size
+            rec.value_quant_block_size = self.v_head_block_size
         else:
+            rec.key = self._pin_if_needed(key) if pin_cpu_result else key
+            rec.value = self._pin_if_needed(value) if pin_cpu_result else value
             rec.key_scale = None
             rec.value_scale = None
-            rec.key_orig_shape = tuple(rec.key.shape)
-            rec.value_orig_shape = tuple(rec.value.shape)
+            rec.key_orig_shape = tuple(key.shape)
+            rec.value_orig_shape = tuple(value.shape)
             rec.quantized_bits = 16
+            rec.key_quant_mode = None
+            rec.value_quant_mode = None
+            rec.key_quant_block_size = None
+            rec.value_quant_block_size = None
 
+    def _quantize_record_in_place(self, rec: LayerKV) -> None:
+        if rec.key is None or rec.value is None:
+            return
+        if self._record_matches_current_quant_config(rec):
+            return
+
+        key_src, value_src = self._materialize_record(rec)
+        pin_cpu_result = key_src.device.type == "cpu"
+        self._store_quantized_record(
+            rec,
+            key_src,
+            value_src,
+            pin_cpu_result=pin_cpu_result,
+        )
         rec.bytes_total = _record_nbytes(rec)
 
     def _move_record_to_device(
@@ -255,46 +580,16 @@ class KVCacheManager:
         """
         Return tensors suitable for passing to model attention.
 
-        When kv_cache_bits == 8 or 4, the resident cache is stored quantized on
-        either CPU or GPU. This method materializes temporary dequantized tensors
-        on the cache's current device for use by the layer forward pass.
+        When kv_cache_bits == 8 or 4, resident cache tensors are stored
+        quantized on either CPU or GPU. This method materializes temporary
+        dequantized tensors on the cache's current device for the layer forward.
         """
         rec = self.layer_kv[layer_idx]
         if rec.key is None or rec.value is None:
             return None, None
-
-        if rec.quantized_bits == 8:
-            assert rec.key_scale is not None and rec.value_scale is not None
-            assert rec.orig_dtype is not None
-            key = _dequantize_tensor_int8(
-                rec.key, rec.key_scale, rec.orig_dtype, rec.key.device
-            )
-            value = _dequantize_tensor_int8(
-                rec.value, rec.value_scale, rec.orig_dtype, rec.value.device
-            )
-            return key, value
-
-        if rec.quantized_bits == 4:
-            assert rec.key_scale is not None and rec.value_scale is not None
-            assert rec.orig_dtype is not None
-            assert rec.key_orig_shape is not None and rec.value_orig_shape is not None
-            key = _dequantize_tensor_int4(
-                rec.key,
-                rec.key_scale,
-                rec.orig_dtype,
-                rec.key.device,
-                rec.key_orig_shape,
-            )
-            value = _dequantize_tensor_int4(
-                rec.value,
-                rec.value_scale,
-                rec.orig_dtype,
-                rec.value.device,
-                rec.value_orig_shape,
-            )
-            return key, value
-
-        return rec.key, rec.value
+        if rec.quantized_bits == 16:
+            return rec.key, rec.value
+        return self._materialize_record(rec)
 
     def update_layer_kv(
         self,
@@ -317,63 +612,32 @@ class KVCacheManager:
             rec.bytes_total = 0
             rec.ready_event = None
             rec.quantized_bits = 16
+            rec.key_quant_mode = None
+            rec.value_quant_mode = None
+            rec.key_quant_block_size = None
+            rec.value_quant_block_size = None
             return
 
-        rec.orig_dtype = key.dtype
         rec.device = str(key.device)
-        rec.key_orig_shape = tuple(key.shape)
-        rec.value_orig_shape = tuple(value.shape)
-
         is_cuda = key.device.type == "cuda"
+
         if is_cuda:
             if stream is None:
                 stream = torch.cuda.current_stream(device=key.device)
             with torch.cuda.stream(stream):
-                if self.kv_cache_bits == 8:
-                    qk, sk = _quantize_tensor_int8(key)
-                    qv, sv = _quantize_tensor_int8(value)
-                    rec.key = qk
-                    rec.value = qv
-                    rec.key_scale = sk
-                    rec.value_scale = sv
-                    rec.quantized_bits = 8
-                elif self.kv_cache_bits == 4:
-                    qk, sk, _ = _quantize_tensor_int4(key)
-                    qv, sv, _ = _quantize_tensor_int4(value)
-                    rec.key = qk
-                    rec.value = qv
-                    rec.key_scale = sk
-                    rec.value_scale = sv
-                    rec.quantized_bits = 4
-                else:
-                    rec.key = key
-                    rec.value = value
-                    rec.key_scale = None
-                    rec.value_scale = None
-                    rec.quantized_bits = 16
+                self._store_quantized_record(
+                    rec,
+                    key,
+                    value,
+                    pin_cpu_result=False,
+                )
         else:
-            if self.kv_cache_bits == 8:
-                qk, sk = _quantize_tensor_int8(key)
-                qv, sv = _quantize_tensor_int8(value)
-                rec.key = self._pin_if_needed(qk)
-                rec.value = self._pin_if_needed(qv)
-                rec.key_scale = self._pin_if_needed(sk)
-                rec.value_scale = self._pin_if_needed(sv)
-                rec.quantized_bits = 8
-            elif self.kv_cache_bits == 4:
-                qk, sk, _ = _quantize_tensor_int4(key)
-                qv, sv, _ = _quantize_tensor_int4(value)
-                rec.key = self._pin_if_needed(qk)
-                rec.value = self._pin_if_needed(qv)
-                rec.key_scale = self._pin_if_needed(sk)
-                rec.value_scale = self._pin_if_needed(sv)
-                rec.quantized_bits = 4
-            else:
-                rec.key = self._pin_if_needed(key)
-                rec.value = self._pin_if_needed(value)
-                rec.key_scale = None
-                rec.value_scale = None
-                rec.quantized_bits = 16
+            self._store_quantized_record(
+                rec,
+                key,
+                value,
+                pin_cpu_result=True,
+            )
 
         rec.bytes_total = _record_nbytes(rec)
 
@@ -446,7 +710,7 @@ class KVCacheManager:
             if not rec.device.startswith("cuda"):
                 continue
 
-            if self.kv_cache_bits in (4, 8) and rec.quantized_bits != self.kv_cache_bits:
+            if self.kv_cache_bits in (4, 8) and not self._record_matches_current_quant_config(rec):
                 self._quantize_record_in_place(rec)
 
             self._move_record_to_device(rec, "cpu", non_blocking=False)
