@@ -248,15 +248,10 @@ def main() -> None:
 
         start = time.perf_counter()
 
-        # generate_batch requires uniform prompt lengths — fall back to per-row
-        # generate() with reset between rows when lengths differ.
-        if len(set(prompt_tokens_per_row)) == 1 and len(batch) > 1:
-            results = generator.generate_batch(
-                request_ids=request_ids,
-                prompts=prompts,
-                max_new_tokens=args.max_new_tokens,
-            )
-        elif len(batch) == 1:
+        # generate_batch handles mixed-length prompts via right-padding +
+        # per-row position_ids. Use it for batch>=2; keep generate() for the
+        # batch=1 path so single-sample profiler/CSV behavior is unchanged.
+        if len(batch) == 1:
             results = [
                 generator.generate(
                     request_id=request_ids[0],
@@ -265,21 +260,11 @@ def main() -> None:
                 )
             ]
         else:
-            print(
-                f"  [warn] mixed prompt lengths {prompt_tokens_per_row} in batch; "
-                "falling back to sequential generate() per row.",
-                flush=True,
+            results = generator.generate_batch(
+                request_ids=request_ids,
+                prompts=prompts,
+                max_new_tokens=args.max_new_tokens,
             )
-            results = []
-            for rid, p in zip(request_ids, prompts):
-                kv_manager.reset()
-                results.append(
-                    generator.generate(
-                        request_id=rid,
-                        prompt=p,
-                        max_new_tokens=args.max_new_tokens,
-                    )
-                )
 
         elapsed = time.perf_counter() - start
 

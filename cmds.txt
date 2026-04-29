@@ -133,16 +133,18 @@ modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \
   "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
    --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
    --task niah_single_1 --kv-cache-bits 4 --max-seq-len 8192 \
-   --max-new-tokens 64 --num-samples 20 --batch-size 4 --profile \
-   --log-dir logs/ruler_niah_single_1_8192_kv4_b4"
+   --max-new-tokens 64 --num-samples 20 --batch-size 20 --profile \
+   --buffer-depth 4 \
+   --log-dir logs/ruler_niah_single_1_8192_kv4_b4/"
 
 # layered, kv4, 4096 ctx, 20 samples, batch=4
 modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \
   "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
    --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
    --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
-   --max-new-tokens 64 --num-samples 20 --batch-size 8 --profile \
-   --log-dir logs/ruler_niah_single_20_4096_kv4_b4"
+   --max-new-tokens 64 --num-samples 20 --batch-size 20 --profile \
+   --buffer-depth 4 \
+   --log-dir logs/ruler_niah_single_20_4096_kv4_b4/"
 
 # vram, kv4, 4096 ctx, 20 samples, batch=4
 modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \

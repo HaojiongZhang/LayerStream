@@ -133,16 +133,31 @@ class ForwardEngine:
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-        seq_len = input_ids.shape[1]
+        """Compute position-related tensors for the current forward step.
 
+        ``cache_position`` always indexes *storage slots* in the KV cache and
+        is a single 1-D tensor (shared across the batch). It drives HF's
+        causal-mask construction.
+
+        ``position_ids`` is the *content* axis used by RoPE. By default we
+        derive it from ``cache_position`` (single-stream / uniform-batch
+        behavior). Callers doing right-padded mixed-length batching should
+        pass per-row ``position_ids`` of shape ``(B, T)`` so each row's
+        rotary angle matches its true position regardless of pad slots.
+        """
+        seq_len = input_ids.shape[1]
         past_len = self.kv_manager.current_seq_len
 
         cache_position = torch.arange(
             past_len, past_len + seq_len,
             device=input_ids.device, dtype=torch.long,
         )
-        position_ids = cache_position.unsqueeze(0) 
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+        # else: caller passed (B, T) per-row positions — use as-is for RoPE.
 
         if self.rotary_emb is not None:
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -275,9 +290,9 @@ class ForwardEngine:
 
         hidden_states = self.embed_tokens(input_ids)
 
-        pos_ids, cache_pos, pos_emb = self._make_position_info(hidden_states, input_ids)
-        if position_ids is None:
-            position_ids = pos_ids
+        position_ids, cache_pos, pos_emb = self._make_position_info(
+            hidden_states, input_ids, position_ids=position_ids,
+        )
 
         for layer_idx, layer in enumerate(self.vram_layers):
             key, value = self.kv_manager.get_layer_kv(layer_idx)
@@ -356,11 +371,10 @@ class ForwardEngine:
         hidden_states = self.embed_tokens(input_ids)
         dbg_mem(f"tok={token_idx} after_embed hidden_shape={tuple(hidden_states.shape)}")
 
-        pos_ids, cache_pos, pos_emb = self._make_position_info(hidden_states, input_ids)
+        position_ids, cache_pos, pos_emb = self._make_position_info(
+            hidden_states, input_ids, position_ids=position_ids,
+        )
         dbg_mem(f"tok={token_idx} after_position_info")
-
-        if position_ids is None:
-            position_ids = pos_ids
 
         true_num_layers = self.prefetcher.weight_store.num_layers()
 

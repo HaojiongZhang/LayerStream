@@ -126,23 +126,28 @@ class Generator:
         prompts: list[str],
         max_new_tokens: int = 64,
     ) -> list[GenerationResult]:
-        """Batched prefill + decode for a list of prompts.
+        """Batched prefill + decode for a list of prompts (mixed lengths OK).
 
-        Constraints:
-        - All prompts must tokenize to the **same length**. The forward engine's
-          positional encoding (RoPE / cache_position) is computed from a single
-          ``kv_manager.current_seq_len`` shared across the batch, so left-padded
-          rows would receive shifted positions and produce wrong outputs.
-          Callers (e.g. ``run_ruler_eval``) should group same-length samples per
-          batch and fall back to ``generate()`` when lengths differ.
-        - Caller must ``kv_manager.reset()`` before each batch — KV state is
-          shared across the whole batch's generation, then dropped.
+        Padding strategy:
+            Right-pad each prompt to ``T_max = max(prompt_lens)``. The pad slots
+            carry per-row position 0 in ``position_ids`` (RoPE angle is computed
+            for them but their attention contribution is zeroed via
+            ``attention_mask``). Each row's *real* prefill positions are
+            ``[0, 1, ..., prompt_lens[b] - 1]`` and decode-step positions are
+            ``prompt_lens[b] + (step - 1)`` for ``step >= 1``.
+
+        First-decode-token logits are extracted per-row at index
+        ``prompt_lens[b] - 1`` (the row's last *real* position), not at
+        ``T_max - 1`` which would be a pad slot for short rows.
+
+        Caller must ``kv_manager.reset()`` before each batch — KV state is
+        shared across the batch's generation, then dropped.
 
         Args:
             request_ids: per-row request id, used for log_request start/end.
-            prompts: list of prompt strings; must be non-empty and uniform-len.
-            max_new_tokens: per-row decode cap. Decode stops early if every row
-                emits EOS.
+            prompts: list of prompt strings; non-empty.
+            max_new_tokens: per-row decode cap. Decode stops early if every
+                row emits EOS.
 
         Returns:
             list[GenerationResult] in the same order as ``prompts``.
@@ -154,44 +159,62 @@ class Generator:
         if not prompts:
             return []
 
-        # Tokenize each prompt independently first to validate uniform length —
-        # the engine's shared positional encoding can't handle mixed lengths.
+        # Per-row tokenization → CPU 1-D LongTensors.
         per_row_ids = [
             self.tokenizer(p, return_tensors="pt")["input_ids"][0] for p in prompts
         ]
         prompt_lens = [int(t.shape[0]) for t in per_row_ids]
-        if len(set(prompt_lens)) != 1:
-            raise ValueError(
-                "generate_batch requires all prompts to tokenize to the same "
-                f"length; got {prompt_lens}. Group same-length prompts per batch "
-                "or fall back to generate() for mixed lengths."
-            )
-
-        prompt_len = prompt_lens[0]
+        T_max = max(prompt_lens)
         batch_size = len(prompts)
 
-        # Stack into (B, T) — no padding needed since all rows are equal len.
-        input_ids = torch.stack(per_row_ids, dim=0).to("cuda")  # (B, T)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.long, device="cuda")
+        device = "cuda"
+        # Llama tokenizers ship without a pad token. Fall back to eos; the pad
+        # K/V is masked out via attention_mask anyway, so the chosen id is
+        # semantically irrelevant.
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        if pad_id is None:
+            pad_id = 0
 
-        for rid, prompt in zip(request_ids, prompts):
+        input_ids = torch.full(
+            (batch_size, T_max), pad_id, dtype=torch.long, device=device,
+        )
+        attention_mask = torch.zeros(
+            (batch_size, T_max), dtype=torch.long, device=device,
+        )
+        # Per-row prefill position_ids (B, T_max). Pad slots stay at 0.
+        prefill_pos_ids = torch.zeros(
+            (batch_size, T_max), dtype=torch.long, device=device,
+        )
+        for b, ids in enumerate(per_row_ids):
+            plen = prompt_lens[b]
+            input_ids[b, :plen] = ids.to(device)
+            attention_mask[b, :plen] = 1
+            prefill_pos_ids[b, :plen] = torch.arange(plen, device=device)
+
+        for rid, prompt, plen in zip(request_ids, prompts, prompt_lens):
             self.logger.log_request(
                 request_id=rid,
                 event="start",
                 prompt=prompt,
-                prompt_len=prompt_len,
+                prompt_len=int(plen),
             )
 
         eos_id = self.eos_token_id
         generated: list[list[int]] = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
 
-        # Use the first request_id for batch-level token/memory logs. Per-row
-        # request_ids are only used for log_request start/end above + below.
+        # First request_id labels per-step token/memory logs. Per-row request
+        # ids only appear in log_request start/end events.
         batch_log_id = request_ids[0]
+
+        prompt_lens_t = torch.tensor(prompt_lens, dtype=torch.long, device=device)
+        row_index_t = torch.arange(batch_size, dtype=torch.long, device=device)
 
         cur_input_ids = input_ids
         cur_attn = attention_mask
+        cur_pos_ids: torch.Tensor = prefill_pos_ids  # (B, T_max) for prefill
 
         for step in range(max_new_tokens):
             token_timer = WallTimer()
@@ -202,10 +225,19 @@ class Generator:
                 token_idx=step,
                 input_ids=cur_input_ids,
                 attention_mask=cur_attn,
-                position_ids=None,
+                position_ids=cur_pos_ids,
             )
 
-            next_tokens = torch.argmax(out.logits[:, -1, :], dim=-1)  # (B,)
+            if step == 0:
+                # Prefill produced (B, T_max, V) logits. Per-row last *real*
+                # position lives at prompt_lens[b] - 1, not at T_max - 1 (pad).
+                last_real_idx = prompt_lens_t - 1
+                step_logits = out.logits[row_index_t, last_real_idx]  # (B, V)
+            else:
+                # Decode steps fed (B, 1) input → out.logits is (B, 1, V).
+                step_logits = out.logits[:, -1, :]  # (B, V)
+
+            next_tokens = torch.argmax(step_logits, dim=-1)  # (B,)
             next_tokens_list = next_tokens.tolist()
 
             for b, tok_id in enumerate(next_tokens_list):
@@ -215,6 +247,7 @@ class Generator:
                 if eos_id is not None and tok_id == eos_id:
                     finished[b] = True
 
+            # Prepare next-step inputs.
             cur_input_ids = next_tokens.view(batch_size, 1).to(input_ids.dtype)
             cur_attn = torch.cat(
                 [
@@ -223,6 +256,12 @@ class Generator:
                 ],
                 dim=1,
             )
+            # Decode-step position for row b: prompt_lens[b] + step
+            #   step=0 just produced the FIRST decoded token. The next forward
+            #   pass feeds it back at content position prompt_lens[b] + 0.
+            #   step=k will have produced k+1 tokens; the next pass uses
+            #   prompt_lens[b] + k, which matches the formula below.
+            cur_pos_ids = (prompt_lens_t + step).view(batch_size, 1)
 
             token_timer.stop()
             allocated_mb, reserved_mb = self._gpu_mem_mb()
@@ -230,7 +269,7 @@ class Generator:
             self.logger.log_token(
                 request_id=batch_log_id,
                 token_idx=step,
-                context_len=prompt_len + step + 1,
+                context_len=T_max + step + 1,
                 token_latency_ms=token_timer.elapsed_ms,
                 copy_total_ms=out.total_copy_ms,
                 compute_total_ms=out.total_compute_ms,
