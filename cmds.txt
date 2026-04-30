@@ -138,7 +138,7 @@ modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \
    --log-dir logs/ruler_niah_single_1_8192_kv4_b4/"
 
 # layered, kv4, 4096 ctx, 20 samples, batch=4
-modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+modal run --detach run_ruler_eval_b200.py --gpu H100:1 --eval-args \
   "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
    --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
    --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
@@ -148,11 +148,68 @@ modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \
 
 # vram, kv4, 4096 ctx, 20 samples, batch=4
 modal run run_ruler_eval_b200.py --gpu H100:1 --eval-args \
-  "--model meta-llama/Llama-2-13b-chat-hf --mode vram \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
    --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
    --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
    --max-new-tokens 64 --num-samples 20 --batch-size 4 --profile \
    --log-dir logs/ruler_niah_single_20_4096_kv4_vram_b4"
+
+modal run --detach run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
+   --max-new-tokens 64 --num-samples 20 --batch-size 1 --profile \
+   --buffer-depth 4 \
+   --log-dir logs/ruler_niah_single_20_4096_kv4_b1_bsweep/"
+
+modal run --detach run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
+   --max-new-tokens 64 --num-samples 20 --batch-size 4 --profile \
+   --buffer-depth 4 \
+   --log-dir logs/ruler_niah_single_20_4096_kv4_b4_bsweep/"
+
+modal run --detach run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
+   --max-new-tokens 64 --num-samples 20 --batch-size 16 --profile \
+   --buffer-depth 4 \
+   --log-dir logs/ruler_niah_single_20_4096_kv4_b16_bsweep/"
+
+# Sweeping buffer-depth:
+modal run --detach run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
+   --max-new-tokens 64 --num-samples 20 --batch-size 2 --profile \
+   --buffer-depth 1 \
+   --log-dir logs/ruler_niah_single_20_4096_kv4_b2_d1/"
+
+modal run --detach run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
+   --max-new-tokens 64 --num-samples 20 --batch-size 2 --profile \
+   --buffer-depth 2 \
+   --log-dir logs/ruler_niah_single_20_4096_kv4_b2_d2/"
+
+modal run --detach run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
+   --max-new-tokens 64 --num-samples 20 --batch-size 2 --profile \
+   --buffer-depth 3 \
+   --log-dir logs/ruler_niah_single_20_4096_kv4_b2_d3/"
+
+modal run --detach run_ruler_eval_b200.py --gpu H100:1 --eval-args \
+  "--model meta-llama/Llama-2-13b-chat-hf --mode layered \
+   --dataset-path ./ruler_data/niah_single_1_4096.jsonl \
+   --task niah_single_1 --kv-cache-bits 4 --max-seq-len 4096 \
+   --max-new-tokens 64 --num-samples 20 --batch-size 2 --profile \
+   --buffer-depth 4 \
+   --log-dir logs/ruler_niah_single_20_4096_kv4_b2_d4/"
 
 # alternative: pin GPU type via env (avoids re-typing --gpu); vram smoke, batch=1
 LAYERSTREAM_GPU=A100-80GB:1 modal run run_ruler_eval_b200.py --eval-args "--model meta-llama/Llama-2-13b-chat-hf --mode vram --dataset-path ./ruler_data/niah_single_1_4096.jsonl --task niah_single_1 --kv-cache-bits 16 --max-seq-len 4096 --max-new-tokens 64 --num-samples 1 --batch-size 1 --profile --log-dir logs/ruler_vram_4096"

@@ -6,8 +6,28 @@ import torch
 import torch.nn.functional as F
 
 
-KEY_QUANT_MODE_SEQ_CHANNEL = "seq_channel"
-VALUE_QUANT_MODE_HEAD_BLOCK = "head_block"
+QUANT_MODE_SEQ_CHANNEL = "seq_channel"
+QUANT_MODE_HEAD_BLOCK = "head_block"
+QUANT_MODE_SINGLE_SCALE = "single_scale"
+QUANT_MODE_PER_HEAD = "per_head"
+
+VALID_QUANT_MODES = (
+    QUANT_MODE_SEQ_CHANNEL,
+    QUANT_MODE_HEAD_BLOCK,
+    QUANT_MODE_SINGLE_SCALE,
+    QUANT_MODE_PER_HEAD,
+)
+
+_BLOCK_BASED_QUANT_MODES = (QUANT_MODE_SEQ_CHANNEL, QUANT_MODE_HEAD_BLOCK)
+
+# Toggle the quantization mode here. KVCacheManager uses these when the
+# constructor is not given explicit k_quant_mode/v_quant_mode arguments.
+DEFAULT_K_QUANT_MODE = QUANT_MODE_SEQ_CHANNEL
+DEFAULT_V_QUANT_MODE = QUANT_MODE_HEAD_BLOCK
+
+# Backward-compatible aliases.
+KEY_QUANT_MODE_SEQ_CHANNEL = QUANT_MODE_SEQ_CHANNEL
+VALUE_QUANT_MODE_HEAD_BLOCK = QUANT_MODE_HEAD_BLOCK
 
 
 @dataclass
@@ -345,6 +365,231 @@ def _dequantize_tensor_int4_seq_channel(
     return deq.to(dtype)
 
 
+# -----------------------------------------------------------------------------
+# Single-scale quantization: one scale value for the entire tensor.
+# Cheapest to compute and store; coarsest accuracy.
+# -----------------------------------------------------------------------------
+
+
+def _quantize_tensor_int8_single_scale(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    x_detached = x.detach()
+    orig_shape = tuple(x_detached.shape)
+    max_abs = x_detached.abs().amax().reshape(1)
+    scale = (max_abs / 127.0).clamp_min(1e-8).to(torch.float32)
+    q = torch.round(x_detached / scale).clamp_(-127, 127).to(torch.int8)
+    return q, scale, orig_shape
+
+
+def _dequantize_tensor_int8_single_scale(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    dtype: torch.dtype,
+    device: str | torch.device,
+    orig_shape: tuple[int, ...],
+) -> torch.Tensor:
+    q_dev = q.to(device, non_blocking=True)
+    scale_dev = scale.to(device, non_blocking=True)
+    deq = q_dev.to(torch.float32) * scale_dev
+    return deq.reshape(orig_shape).to(dtype)
+
+
+def _quantize_tensor_int4_single_scale(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    x_detached = x.detach()
+    orig_shape = tuple(x_detached.shape)
+    max_abs = x_detached.abs().amax().reshape(1)
+    scale = (max_abs / 7.0).clamp_min(1e-8).to(torch.float32)
+    q = torch.round(x_detached / scale).clamp_(-8, 7).to(torch.int8)
+
+    if q.shape[-1] % 2 != 0:
+        q = F.pad(q, (0, 1), mode="constant", value=0)
+
+    q_i16 = q.to(torch.int16)
+    low = (q_i16[..., 0::2] & 0x0F).to(torch.uint8)
+    high = ((q_i16[..., 1::2] & 0x0F) << 4).to(torch.uint8)
+    packed = low | high
+    return packed, scale, orig_shape
+
+
+def _dequantize_tensor_int4_single_scale(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    dtype: torch.dtype,
+    device: str | torch.device,
+    orig_shape: tuple[int, ...],
+) -> torch.Tensor:
+    packed_dev = packed.to(device, non_blocking=True)
+    scale_dev = scale.to(device, non_blocking=True)
+    unpacked = _unpack_signed_int4(packed_dev)
+    unpacked = unpacked[..., : orig_shape[-1]]
+    deq = unpacked.to(torch.float32) * scale_dev
+    return deq.reshape(orig_shape).to(dtype)
+
+
+# -----------------------------------------------------------------------------
+# Per-head quantization: one scale per head index.
+# Tensor shape convention: [..., H, S, D] (e.g. [B, H, S, D] for HF KV cache).
+# Scale is reduced over the seq and head_dim axes only, so the head dim at -3
+# keeps an independent scale.
+# -----------------------------------------------------------------------------
+
+
+def _quantize_tensor_int8_per_head(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    if x.ndim < 3:
+        raise ValueError(
+            "per-head quantization requires at least 3 dims [..., H, S, D]"
+        )
+    x_detached = x.detach()
+    orig_shape = tuple(x_detached.shape)
+    max_abs = x_detached.abs().amax(dim=(-2, -1), keepdim=True)
+    scale = (max_abs / 127.0).clamp_min(1e-8).to(torch.float32)
+    q = torch.round(x_detached / scale).clamp_(-127, 127).to(torch.int8)
+    return q, scale, orig_shape
+
+
+def _dequantize_tensor_int8_per_head(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    dtype: torch.dtype,
+    device: str | torch.device,
+    orig_shape: tuple[int, ...],
+) -> torch.Tensor:
+    q_dev = q.to(device, non_blocking=True)
+    scale_dev = scale.to(device, non_blocking=True)
+    deq = q_dev.to(torch.float32) * scale_dev
+    return deq.reshape(orig_shape).to(dtype)
+
+
+def _quantize_tensor_int4_per_head(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    if x.ndim < 3:
+        raise ValueError(
+            "per-head quantization requires at least 3 dims [..., H, S, D]"
+        )
+    x_detached = x.detach()
+    orig_shape = tuple(x_detached.shape)
+    max_abs = x_detached.abs().amax(dim=(-2, -1), keepdim=True)
+    scale = (max_abs / 7.0).clamp_min(1e-8).to(torch.float32)
+    q = torch.round(x_detached / scale).clamp_(-8, 7).to(torch.int8)
+
+    if q.shape[-1] % 2 != 0:
+        q = F.pad(q, (0, 1), mode="constant", value=0)
+
+    q_i16 = q.to(torch.int16)
+    low = (q_i16[..., 0::2] & 0x0F).to(torch.uint8)
+    high = ((q_i16[..., 1::2] & 0x0F) << 4).to(torch.uint8)
+    packed = low | high
+    return packed, scale, orig_shape
+
+
+def _dequantize_tensor_int4_per_head(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    dtype: torch.dtype,
+    device: str | torch.device,
+    orig_shape: tuple[int, ...],
+) -> torch.Tensor:
+    packed_dev = packed.to(device, non_blocking=True)
+    scale_dev = scale.to(device, non_blocking=True)
+    unpacked = _unpack_signed_int4(packed_dev)
+    unpacked = unpacked[..., : orig_shape[-1]]
+    deq = unpacked.to(torch.float32) * scale_dev
+    return deq.reshape(orig_shape).to(dtype)
+
+
+# -----------------------------------------------------------------------------
+# Mode dispatch.
+# -----------------------------------------------------------------------------
+
+
+def _quantize_dispatch(
+    x: torch.Tensor,
+    mode: str,
+    bits: int,
+    block_size: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    if bits == 8:
+        if mode == QUANT_MODE_SEQ_CHANNEL:
+            assert block_size is not None
+            return _quantize_tensor_int8_seq_channel(x, block_size)
+        if mode == QUANT_MODE_HEAD_BLOCK:
+            assert block_size is not None
+            return _quantize_tensor_int8_head_block(x, block_size)
+        if mode == QUANT_MODE_SINGLE_SCALE:
+            return _quantize_tensor_int8_single_scale(x)
+        if mode == QUANT_MODE_PER_HEAD:
+            return _quantize_tensor_int8_per_head(x)
+    elif bits == 4:
+        if mode == QUANT_MODE_SEQ_CHANNEL:
+            assert block_size is not None
+            return _quantize_tensor_int4_seq_channel(x, block_size)
+        if mode == QUANT_MODE_HEAD_BLOCK:
+            assert block_size is not None
+            return _quantize_tensor_int4_head_block(x, block_size)
+        if mode == QUANT_MODE_SINGLE_SCALE:
+            return _quantize_tensor_int4_single_scale(x)
+        if mode == QUANT_MODE_PER_HEAD:
+            return _quantize_tensor_int4_per_head(x)
+    raise RuntimeError(f"Unsupported quantization config: mode={mode}, bits={bits}")
+
+
+def _dequantize_dispatch(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    mode: str,
+    bits: int,
+    dtype: torch.dtype,
+    device: str | torch.device,
+    orig_shape: tuple[int, ...],
+    block_size: int | None,
+) -> torch.Tensor:
+    if bits == 8:
+        if mode == QUANT_MODE_SEQ_CHANNEL:
+            assert block_size is not None
+            return _dequantize_tensor_int8_seq_channel(
+                q, scale, dtype, device, orig_shape, block_size
+            )
+        if mode == QUANT_MODE_HEAD_BLOCK:
+            assert block_size is not None
+            return _dequantize_tensor_int8_head_block(
+                q, scale, dtype, device, orig_shape, block_size
+            )
+        if mode == QUANT_MODE_SINGLE_SCALE:
+            return _dequantize_tensor_int8_single_scale(
+                q, scale, dtype, device, orig_shape
+            )
+        if mode == QUANT_MODE_PER_HEAD:
+            return _dequantize_tensor_int8_per_head(
+                q, scale, dtype, device, orig_shape
+            )
+    elif bits == 4:
+        if mode == QUANT_MODE_SEQ_CHANNEL:
+            assert block_size is not None
+            return _dequantize_tensor_int4_seq_channel(
+                q, scale, dtype, device, orig_shape, block_size
+            )
+        if mode == QUANT_MODE_HEAD_BLOCK:
+            assert block_size is not None
+            return _dequantize_tensor_int4_head_block(
+                q, scale, dtype, device, orig_shape, block_size
+            )
+        if mode == QUANT_MODE_SINGLE_SCALE:
+            return _dequantize_tensor_int4_single_scale(
+                q, scale, dtype, device, orig_shape
+            )
+        if mode == QUANT_MODE_PER_HEAD:
+            return _dequantize_tensor_int4_per_head(
+                q, scale, dtype, device, orig_shape
+            )
+    raise RuntimeError(f"Unsupported quantization config: mode={mode}, bits={bits}")
+
+
 class KVCacheManager:
     def __init__(
         self,
@@ -360,7 +605,17 @@ class KVCacheManager:
         # Asymmetric K/V defaults.
         k_seq_block_size: int | None = None,
         v_head_block_size: int | None = None,
+        # Quantization mode per K/V. Block sizes above only apply when the mode
+        # is one of the block-based modes (seq_channel, head_block). Defaults
+        # come from the module-level DEFAULT_{K,V}_QUANT_MODE constants so the
+        # mode can be toggled in one place without touching call sites.
+        k_quant_mode: str | None = None,
+        v_quant_mode: str | None = None,
     ) -> None:
+        if k_quant_mode is None:
+            k_quant_mode = DEFAULT_K_QUANT_MODE
+        if v_quant_mode is None:
+            v_quant_mode = DEFAULT_V_QUANT_MODE
         if kv_cache_bits not in (4, 8, 16):
             raise ValueError(
                 f"Unsupported kv_cache_bits={kv_cache_bits}; expected 4, 8 or 16"
@@ -369,12 +624,23 @@ class KVCacheManager:
             raise ValueError(
                 f"Unsupported kv_quant_block_size={kv_quant_block_size}; expected > 0"
             )
+        if k_quant_mode not in VALID_QUANT_MODES:
+            raise ValueError(
+                f"Unsupported k_quant_mode={k_quant_mode}; expected one of {VALID_QUANT_MODES}"
+            )
+        if v_quant_mode not in VALID_QUANT_MODES:
+            raise ValueError(
+                f"Unsupported v_quant_mode={v_quant_mode}; expected one of {VALID_QUANT_MODES}"
+            )
 
         self.max_gpu_kv_bytes = max_gpu_kv_bytes
         self.max_seq_len = max_seq_len
         self.enable_cpu_offload = enable_cpu_offload
         self.pin_cpu_memory = pin_cpu_memory
         self.kv_cache_bits = kv_cache_bits
+
+        self.k_quant_mode = k_quant_mode
+        self.v_quant_mode = v_quant_mode
 
         self.k_seq_block_size = (
             kv_quant_block_size if k_seq_block_size is None else k_seq_block_size
@@ -393,6 +659,20 @@ class KVCacheManager:
 
         self.layer_kv: list[LayerKV] = [LayerKV() for _ in range(num_layers)]
         self.current_seq_len = 0
+
+    def _k_block_size(self) -> int | None:
+        return (
+            self.k_seq_block_size
+            if self.k_quant_mode in _BLOCK_BASED_QUANT_MODES
+            else None
+        )
+
+    def _v_block_size(self) -> int | None:
+        return (
+            self.v_head_block_size
+            if self.v_quant_mode in _BLOCK_BASED_QUANT_MODES
+            else None
+        )
 
     def reset(self) -> None:
         """Drop all per-layer KV state and reset the seq-len counter.
@@ -432,12 +712,15 @@ class KVCacheManager:
             return False
         if self.kv_cache_bits == 16:
             return True
-        return (
-            rec.key_quant_mode == KEY_QUANT_MODE_SEQ_CHANNEL
-            and rec.value_quant_mode == VALUE_QUANT_MODE_HEAD_BLOCK
-            and rec.key_quant_block_size == self.k_seq_block_size
-            and rec.value_quant_block_size == self.v_head_block_size
-        )
+        if rec.key_quant_mode != self.k_quant_mode:
+            return False
+        if rec.value_quant_mode != self.v_quant_mode:
+            return False
+        if rec.key_quant_block_size != self._k_block_size():
+            return False
+        if rec.value_quant_block_size != self._v_block_size():
+            return False
+        return True
 
     def _materialize_record(self, rec: LayerKV) -> tuple[torch.Tensor, torch.Tensor]:
         """Return dequantized key/value on the record's current device."""
@@ -448,54 +731,35 @@ class KVCacheManager:
             raise RuntimeError("Cannot materialize quantized KV without orig_dtype")
         if rec.key_orig_shape is None or rec.value_orig_shape is None:
             raise RuntimeError("Cannot materialize quantized KV without original shapes")
-        if rec.key_quant_block_size is None or rec.value_quant_block_size is None:
-            raise RuntimeError("Cannot materialize quantized KV without block sizes")
-        if rec.key_quant_mode != KEY_QUANT_MODE_SEQ_CHANNEL:
-            raise RuntimeError(f"Unsupported key_quant_mode={rec.key_quant_mode}")
-        if rec.value_quant_mode != VALUE_QUANT_MODE_HEAD_BLOCK:
-            raise RuntimeError(f"Unsupported value_quant_mode={rec.value_quant_mode}")
+        if rec.key_quant_mode is None or rec.value_quant_mode is None:
+            raise RuntimeError("Cannot materialize quantized KV without quant modes")
+        if rec.key_quant_mode in _BLOCK_BASED_QUANT_MODES and rec.key_quant_block_size is None:
+            raise RuntimeError("Cannot materialize block-quantized K without block size")
+        if rec.value_quant_mode in _BLOCK_BASED_QUANT_MODES and rec.value_quant_block_size is None:
+            raise RuntimeError("Cannot materialize block-quantized V without block size")
 
-        if rec.quantized_bits == 8:
-            assert rec.key_scale is not None and rec.value_scale is not None
-            key = _dequantize_tensor_int8_seq_channel(
-                rec.key,
-                rec.key_scale,
-                rec.orig_dtype,
-                rec.key.device,
-                rec.key_orig_shape,
-                rec.key_quant_block_size,
-            )
-            value = _dequantize_tensor_int8_head_block(
-                rec.value,
-                rec.value_scale,
-                rec.orig_dtype,
-                rec.value.device,
-                rec.value_orig_shape,
-                rec.value_quant_block_size,
-            )
-            return key, value
-
-        if rec.quantized_bits == 4:
-            assert rec.key_scale is not None and rec.value_scale is not None
-            key = _dequantize_tensor_int4_seq_channel(
-                rec.key,
-                rec.key_scale,
-                rec.orig_dtype,
-                rec.key.device,
-                rec.key_orig_shape,
-                rec.key_quant_block_size,
-            )
-            value = _dequantize_tensor_int4_head_block(
-                rec.value,
-                rec.value_scale,
-                rec.orig_dtype,
-                rec.value.device,
-                rec.value_orig_shape,
-                rec.value_quant_block_size,
-            )
-            return key, value
-
-        raise RuntimeError(f"Unsupported rec.quantized_bits={rec.quantized_bits}")
+        assert rec.key_scale is not None and rec.value_scale is not None
+        key = _dequantize_dispatch(
+            rec.key,
+            rec.key_scale,
+            rec.key_quant_mode,
+            rec.quantized_bits,
+            rec.orig_dtype,
+            rec.key.device,
+            rec.key_orig_shape,
+            rec.key_quant_block_size,
+        )
+        value = _dequantize_dispatch(
+            rec.value,
+            rec.value_scale,
+            rec.value_quant_mode,
+            rec.quantized_bits,
+            rec.orig_dtype,
+            rec.value.device,
+            rec.value_orig_shape,
+            rec.value_quant_block_size,
+        )
+        return key, value
 
     def _store_quantized_record(
         self,
@@ -506,33 +770,15 @@ class KVCacheManager:
         pin_cpu_result: bool,
     ) -> None:
         rec.orig_dtype = key.dtype
-        rec.key_orig_shape = tuple(key.shape)
-        rec.value_orig_shape = tuple(value.shape)
 
-        if self.kv_cache_bits == 8:
-            qk, sk, kshape = _quantize_tensor_int8_seq_channel(
-                key, self.k_seq_block_size
+        if self.kv_cache_bits in (8, 4):
+            k_block_size = self._k_block_size()
+            v_block_size = self._v_block_size()
+            qk, sk, kshape = _quantize_dispatch(
+                key, self.k_quant_mode, self.kv_cache_bits, k_block_size
             )
-            qv, sv, vshape = _quantize_tensor_int8_head_block(
-                value, self.v_head_block_size
-            )
-            rec.key = self._pin_if_needed(qk) if pin_cpu_result else qk
-            rec.value = self._pin_if_needed(qv) if pin_cpu_result else qv
-            rec.key_scale = self._pin_if_needed(sk) if pin_cpu_result else sk
-            rec.value_scale = self._pin_if_needed(sv) if pin_cpu_result else sv
-            rec.key_orig_shape = kshape
-            rec.value_orig_shape = vshape
-            rec.quantized_bits = 8
-            rec.key_quant_mode = KEY_QUANT_MODE_SEQ_CHANNEL
-            rec.value_quant_mode = VALUE_QUANT_MODE_HEAD_BLOCK
-            rec.key_quant_block_size = self.k_seq_block_size
-            rec.value_quant_block_size = self.v_head_block_size
-        elif self.kv_cache_bits == 4:
-            qk, sk, kshape = _quantize_tensor_int4_seq_channel(
-                key, self.k_seq_block_size
-            )
-            qv, sv, vshape = _quantize_tensor_int4_head_block(
-                value, self.v_head_block_size
+            qv, sv, vshape = _quantize_dispatch(
+                value, self.v_quant_mode, self.kv_cache_bits, v_block_size
             )
             rec.key = self._pin_if_needed(qk) if pin_cpu_result else qk
             rec.value = self._pin_if_needed(qv) if pin_cpu_result else qv
@@ -540,11 +786,11 @@ class KVCacheManager:
             rec.value_scale = self._pin_if_needed(sv) if pin_cpu_result else sv
             rec.key_orig_shape = kshape
             rec.value_orig_shape = vshape
-            rec.quantized_bits = 4
-            rec.key_quant_mode = KEY_QUANT_MODE_SEQ_CHANNEL
-            rec.value_quant_mode = VALUE_QUANT_MODE_HEAD_BLOCK
-            rec.key_quant_block_size = self.k_seq_block_size
-            rec.value_quant_block_size = self.v_head_block_size
+            rec.quantized_bits = self.kv_cache_bits
+            rec.key_quant_mode = self.k_quant_mode
+            rec.value_quant_mode = self.v_quant_mode
+            rec.key_quant_block_size = k_block_size
+            rec.value_quant_block_size = v_block_size
         else:
             rec.key = self._pin_if_needed(key) if pin_cpu_result else key
             rec.value = self._pin_if_needed(value) if pin_cpu_result else value
